@@ -1,0 +1,22 @@
+meta {
+  name: DELETE Queue
+  type: http
+  seq: 4
+}
+
+delete {
+  url: {{BASE_URI}}/queue
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{TOKEN}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "id":"658020c2ef6325c8471edc65"
+  }
+}
