@@ -1,6 +1,9 @@
 const jwt = require('jsonwebtoken');
 
 function getBearerToken(req) {
+  if (req.headers['x-access-token']) {
+    return req.headers['x-access-token'];
+  }
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
     return authHeader.substring(7);

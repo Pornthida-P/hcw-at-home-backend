@@ -19,7 +19,25 @@ module.exports = {
       sails.config.customLogger.log('info', `User disconnected: ID=${user.id}, Reason=${reason}`, null, 'server-action', req.user?.id);
       const isLast = remove(user.id, socketId);
       if (isLast) {
-        await Consultation.changeOnlineStatus(user, false);
+        try {
+          await Consultation.changeOnlineStatus(user, false);
+        } catch (err) {
+          // During server shutdown, ORM/datastore may already be torn down (race condition).
+          // Log and ignore so shutdown can complete without uncaught exception.
+          const isTeardownError = err && (
+            (err.adapterMethodName && err.modelIdentity) ||
+            (typeof err.message === 'string' && (
+              err.message.includes('datastore') ||
+              err.message.includes('torn down') ||
+              err.message.includes('Consistency violation')
+            ))
+          );
+          if (isTeardownError) {
+            sails.config.customLogger.log('info', `Skipping changeOnlineStatus on disconnect (app likely shutting down): ${err.message}`, null, 'server-action', req.user?.id);
+          } else {
+            sails.config.customLogger.log('error', `changeOnlineStatus failed on disconnect: ${err?.message || err}`, err, 'server-action', req.user?.id);
+          }
+        }
       } else {
         sails.log.info('info',`User ${user.id} has other active sockets, skipping offline broadcast`, null, 'server-action', req.user?.id);
       }
