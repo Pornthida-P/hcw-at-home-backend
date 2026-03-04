@@ -150,6 +150,8 @@ module.exports = {
        allowOrigins: [
          'http://localhost:4300',
          'http://localhost:4200',
+         'http://localhost:4201',
+         'http://localhost:4202',
          'http://localhost',
         //  'ionic://localhost',
        ]

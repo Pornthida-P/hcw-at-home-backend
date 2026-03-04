@@ -35,6 +35,8 @@ module.exports.security = {
       "http://localhost:8100",
       "http://localhost:36165",
       "http://localhost:4200",
+      "http://localhost:4201",
+      "http://localhost:4202",
       "http://localhost:4300",
       "http://localhost:49321",
       "http://localhost:4400",
