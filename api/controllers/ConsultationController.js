@@ -1,17 +1,161 @@
-const { ObjectId } = require('mongodb');
-const fs = require('fs');
-const json2csv = require('@json2csv/plainjs');
-const uuid = require('uuid');
-const path = require('path');
-const moment = require('moment-timezone');
+const { ObjectId } = require("mongodb");
+const fs = require("fs");
+const json2csv = require("@json2csv/plainjs");
+const uuid = require("uuid");
+const path = require("path");
+const moment = require("moment-timezone");
 
-const validator = require('validator');
-const { escapeHtml, sanitizeMetadata } = require('../utils/helpers');
+const validator = require("validator");
+const mediasoupClient = require("../utils/mediasoup-client");
+const { escapeHtml, sanitizeMetadata } = require("../utils/helpers");
+const { getExpertInvitationURL } = require("../utils/invite-urls");
+
+// Find the mediasoup error (helpers may wrap thrown errors)
+function findMediasoupError(err) {
+  let current = err;
+  for (let i = 0; current && i < 4; i++) {
+    if (current.isMediasoupError) {
+      return current;
+    }
+    current = current.raw || current.cause;
+  }
+  return null;
+}
+
+// Map video server failures to 502/503/504 with a clear message
+// instead of a generic 400 "An error occurred"
+function sendCallError(res, err, fallbackStatus) {
+  const mediasoupError = findMediasoupError(err);
+  if (mediasoupError) {
+    return res.status(mediasoupError.httpStatus || 502).json({
+      error: mediasoupError.code || "MEDIASOUP_ERROR",
+      message: mediasoupError.message,
+      details: mediasoupError.message,
+    });
+  }
+  return res
+    .status(fallbackStatus)
+    .json({ error: "An error occurred", details: err?.message });
+}
+
+function noMediasoupServerError() {
+  const err = new Error(
+    "No video server available: set MEDIASOUP_URL / MEDIASOUP_USER / MEDIASOUP_SECRET in the backend environment or add an active, reachable server in Admin > Mediasoup.",
+  );
+  err.httpStatus = 503;
+  err.code = "MEDIASOUP_NOT_CONFIGURED";
+  err.isMediasoupError = true;
+  return err;
+}
 
 const db = Consultation.getDatastore().manager;
 
-module.exports = {
+//  parse the optional `from` / `to` query params used by the admin
+// dashboard (stats + CSV). Accepts epoch milliseconds or an ISO date
+// (YYYY-MM-DD => from = start of day, to = end of day, server timezone).
+function parseDateParam(value, endOfDay) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+  const str = String(value).trim();
+  if (/^\d{10,14}$/.test(str)) {
+    const n = parseInt(str, 10);
+    return Number.isFinite(n) ? n : undefined;
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str)) {
+    const m = moment(str, "YYYY-MM-DD", true);
+    if (!m.isValid()) {
+      return undefined;
+    }
+    return (endOfDay ? m.endOf("day") : m.startOf("day")).valueOf();
+  }
+  const t = Date.parse(str);
+  return Number.isNaN(t) ? undefined : t;
+}
 
+function parseDateRange(query) {
+  const from = parseDateParam(query && query.from, false);
+  const to = parseDateParam(query && query.to, true);
+  if (from === undefined || to === undefined) {
+    return { error: "invalidDate" };
+  }
+  if (from !== null && to !== null && from > to) {
+    return { error: "fromAfterTo" };
+  }
+  return { from, to };
+}
+
+function rangeCriteria(from, to) {
+  const c = {};
+  if (from !== null) {
+    c[">="] = from;
+  }
+  if (to !== null) {
+    c["<="] = to;
+  }
+  return Object.keys(c).length ? c : null;
+}
+
+// Closed (archived) consultations are filtered on the date the patient joined
+// (consultationCreatedAt), falling back to closedAt for old records without it.
+function anonymousConsultationWhere(from, to) {
+  const range = rangeCriteria(from, to);
+  if (!range) {
+    return {};
+  }
+  // Waterline stores a missing number as 0: such records only match on closedAt
+  const createdRange = rangeCriteria(from !== null && from > 0 ? from : 1, to);
+  return {
+    or: [
+      { consultationCreatedAt: createdRange },
+      { consultationCreatedAt: 0, closedAt: range },
+      { consultationCreatedAt: null, closedAt: range },
+    ],
+  };
+}
+
+// Pending / active consultations are filtered on createdAt (patient joined).
+function liveConsultationWhere(from, to) {
+  const where = { status: { in: ["pending", "active"] } };
+  const createdRange = rangeCriteria(from, to);
+  if (createdRange) {
+    where.createdAt = createdRange;
+  }
+  return where;
+}
+
+// Duration of a closed consultation: closedAt - (acceptedAt || joined at).
+// Returns null when a timestamp is missing or the result is negative.
+function consultationDuration(c) {
+  const start = c.acceptedAt || c.consultationCreatedAt;
+  if (!start || !c.closedAt || c.closedAt < start) {
+    return null;
+  }
+  return c.closedAt - start;
+}
+
+function personName(user) {
+  if (!user) {
+    return "";
+  }
+  return (
+    [user.firstName, user.lastName].filter(Boolean).join(" ") ||
+    user.email ||
+    ""
+  );
+}
+
+function average(values) {
+  const v = values.filter(
+    (x) => typeof x === "number" && Number.isFinite(x) && x >= 0,
+  );
+  if (!v.length) {
+    return null;
+  }
+  return v.reduce((a, b) => a + b, 0) / v.length;
+}
+
+module.exports = {
   async consultationOverview(req, res) {
     try {
       let match = [
@@ -19,7 +163,7 @@ module.exports = {
           owner: new ObjectId(req.user.id),
         },
       ];
-      if (req.user && req.user.role === 'doctor') {
+      if (req.user && req.user.role === "doctor") {
         match = [
           {
             acceptedBy: new ObjectId(req.user.id),
@@ -31,19 +175,19 @@ module.exports = {
         ];
       }
 
-      if (req.user && req.user.role === 'translator') {
+      if (req.user && req.user.role === "translator") {
         match = [{ translator: new ObjectId(req.user.id) }];
       }
 
-      if (req.user && req.user.role === 'guest') {
+      if (req.user && req.user.role === "guest") {
         match = [{ guest: new ObjectId(req.user.id) }];
       }
 
-      if (req.user && req.user.role === 'expert') {
+      if (req.user && req.user.role === "expert") {
         match = [{ experts: req.user.id }];
       }
 
-      if (req.user && req.user.role === 'admin') {
+      if (req.user && req.user.role === "admin") {
         match = [
           {
             acceptedBy: new ObjectId(req.user.id),
@@ -57,36 +201,58 @@ module.exports = {
         ];
       }
 
-      if (req.user.role === 'doctor' || req.user.role === 'admin') {
+      if (req.user.role === "doctor" || req.user.role === "admin") {
         if (req.user.viewAllQueues) {
           const queues = (await Queue.find({})).map(
-            (queue) => new ObjectId(queue.id)
+            (queue) => new ObjectId(queue.id),
           );
           match.push({
-            status: 'pending',
+            status: "pending",
             queue: { $in: queues },
           });
-        } else if (req.user.allowedQueues && req.user.allowedQueues.length > 0) {
+        } else if (
+          req.user.allowedQueues &&
+          req.user.allowedQueues.length > 0
+        ) {
           const queues = req.user.allowedQueues.map(
-            (queue) => new ObjectId(queue.id)
+            (queue) => new ObjectId(queue.id),
           );
 
           match.push({
-            status: 'pending',
+            status: "pending",
             queue: { $in: queues },
           });
         }
 
         const sharedQueues = await Queue.find({
-          shareWhenOpened: true
+          shareWhenOpened: true,
         });
 
         if (sharedQueues.length > 0) {
-          const sharedQueueIds = sharedQueues.map(q => new ObjectId(q.id));
+          let filteredSharedQueues = sharedQueues;
+          if (
+            !req.user.viewAllQueues &&
+            req.user.allowedQueues &&
+            req.user.allowedQueues.length > 0
+          ) {
+            const userQueueIds = req.user.allowedQueues.map((q) =>
+              q.id.toString(),
+            );
+            filteredSharedQueues = sharedQueues.filter((q) =>
+              userQueueIds.includes(q.id.toString()),
+            );
+          } else if (!req.user.viewAllQueues) {
+            filteredSharedQueues = [];
+          }
 
-          match.push({
-            queue: { $in: sharedQueueIds }
-          });
+          if (filteredSharedQueues.length > 0) {
+            const sharedQueueIds = filteredSharedQueues.map(
+              (q) => new ObjectId(q.id),
+            );
+            match.push({
+              queue: { $in: sharedQueueIds },
+            });
+          }
         }
       }
 
@@ -103,22 +269,22 @@ module.exports = {
         },
         {
           $project: {
-            consultation: '$$ROOT',
+            consultation: "$$ROOT",
           },
         },
         {
           $lookup: {
-            from: 'message',
-            localField: '_id',
-            foreignField: 'consultation',
-            as: 'messages',
+            from: "message",
+            localField: "_id",
+            foreignField: "consultation",
+            as: "messages",
           },
         },
         {
           $project: {
             consultation: 1,
             lastMsg: {
-              $arrayElemAt: ['$messages', -1],
+              $arrayElemAt: ["$messages", -1],
             },
             messages: 1,
           },
@@ -129,20 +295,20 @@ module.exports = {
             lastMsg: 1,
             messages: {
               $filter: {
-                input: '$messages',
-                as: 'msg',
+                input: "$messages",
+                as: "msg",
                 cond: {
                   $and: [
                     {
-                      $eq: ['$$msg.read', false],
+                      $eq: ["$$msg.read", false],
                     },
                     {
                       $or: [
                         {
-                          $eq: ['$$msg.to', new ObjectId(req.user.id)],
+                          $eq: ["$$msg.to", new ObjectId(req.user.id)],
                         },
                         {
-                          $eq: ['$$msg.to', null],
+                          $eq: ["$$msg.to", null],
                         },
                       ],
                     },
@@ -157,72 +323,72 @@ module.exports = {
             consultation: 1,
             lastMsg: 1,
             unreadCount: {
-              $size: '$messages',
+              $size: "$messages",
             },
           },
         },
         {
           $lookup: {
-            from: 'user',
-            localField: 'consultation.owner',
-            foreignField: '_id',
-            as: 'nurse',
+            from: "user",
+            localField: "consultation.owner",
+            foreignField: "_id",
+            as: "nurse",
           },
         },
         {
           $lookup: {
-            from: 'queue',
-            localField: 'consultation.queue',
-            foreignField: '_id',
-            as: 'queue',
+            from: "queue",
+            localField: "consultation.queue",
+            foreignField: "_id",
+            as: "queue",
           },
         },
         {
           $lookup: {
-            from: 'user',
-            localField: 'consultation.acceptedBy',
-            foreignField: '_id',
-            as: 'doctor',
+            from: "user",
+            localField: "consultation.acceptedBy",
+            foreignField: "_id",
+            as: "doctor",
           },
         },
         {
           $lookup: {
-            from: 'user',
-            localField: 'consultation.translator',
-            foreignField: '_id',
-            as: 'translator',
+            from: "user",
+            localField: "consultation.translator",
+            foreignField: "_id",
+            as: "translator",
           },
         },
         {
           $lookup: {
-            from: 'user',
-            localField: 'consultation.guest',
-            foreignField: '_id',
-            as: 'guest',
+            from: "user",
+            localField: "consultation.guest",
+            foreignField: "_id",
+            as: "guest",
           },
         },
         {
           $lookup: {
-            from: 'publicinvite',
-            localField: 'consultation.guestInvite',
-            foreignField: '_id',
-            as: 'guestInvite',
+            from: "publicinvite",
+            localField: "consultation.guestInvite",
+            foreignField: "_id",
+            as: "guestInvite",
           },
         },
         {
           $lookup: {
-            from: 'user',
-            let: { expertIds: '$consultation.experts' },
+            from: "user",
+            let: { expertIds: "$consultation.experts" },
             pipeline: [
               {
                 $match: {
                   $expr: {
-                    $in: ['$_id', { $ifNull: ['$$expertIds', []] }]
-                  }
-                }
-              }
+                    $in: ["$_id", { $ifNull: ["$$expertIds", []] }],
+                  },
+                },
+              },
             ],
-            as: 'experts',
+            as: "experts",
           },
         },
         {
@@ -240,16 +406,16 @@ module.exports = {
             lastMsg: 1,
             unreadCount: 1,
             doctor: {
-              $arrayElemAt: ['$doctor', 0],
+              $arrayElemAt: ["$doctor", 0],
             },
             nurse: {
-              $arrayElemAt: ['$nurse', 0],
+              $arrayElemAt: ["$nurse", 0],
             },
             queue: {
-              $arrayElemAt: ['$queue', 0],
+              $arrayElemAt: ["$queue", 0],
             },
             guestInvite: {
-              $arrayElemAt: ['$guestInvite', 0],
+              $arrayElemAt: ["$guestInvite", 0],
             },
             experts: 1,
           },
@@ -259,29 +425,29 @@ module.exports = {
             consultation: 1,
             lastMsg: 1,
             unreadCount: 1,
-            'doctor.firstName': 1,
-            'doctor.lastName': 1,
-            'doctor.phoneNumber': 1,
-            'nurse.firstName': 1,
-            'nurse.lastName': 1,
-            'queue': 1,
+            "doctor.firstName": 1,
+            "doctor.lastName": 1,
+            "doctor.phoneNumber": 1,
+            "nurse.firstName": 1,
+            "nurse.lastName": 1,
+            queue: 1,
             guestInvite: 1,
             guest: {
-              $arrayElemAt: ['$guest', 0],
+              $arrayElemAt: ["$guest", 0],
             },
             translator: {
-              $arrayElemAt: ['$translator', 0],
+              $arrayElemAt: ["$translator", 0],
             },
             experts: 1,
             acceptedByUser: {
               $cond: {
-                if: { $ne: ['$doctor', null] },
+                if: { $ne: ["$doctor", null] },
                 then: {
-                  firstName: '$doctor.firstName',
-                  lastName: '$doctor.lastName'
+                  firstName: "$doctor.firstName",
+                  lastName: "$doctor.lastName",
                 },
-                else: null
-              }
+                else: null,
+              },
             },
           },
         },
@@ -293,40 +459,78 @@ module.exports = {
         },
       ];
 
-      sails.config.customLogger.log('info', 'Running consultation overview aggregation', null, 'message', req.user?.id);
+      sails.config.customLogger.log(
+        "info",
+        "Running consultation overview aggregation",
+        null,
+        "message",
+        req.user?.id,
+      );
 
-      const consultationCollection = db.collection('consultation');
+      const consultationCollection = db.collection("consultation");
       const results = await consultationCollection.aggregate(agg);
       const data = await results.toArray();
 
-      sails.config.customLogger.log('info', `Aggregation completed resultCount is ${data.length}`, null, 'message', req.user?.id);
+      sails.config.customLogger.log(
+        "info",
+        `Aggregation completed resultCount is ${data.length}`,
+        null,
+        "message",
+        req.user?.id,
+      );
 
       for (const index in data) {
         const item = data[index];
+        // Always rebuild the expert link from the stored expert token
+        // with the current EXPERT_URL/PUBLIC_URL (the stored URL is frozen at
+        // consultation creation time and may point to an outdated host/path).
+        if (item.consultation && item.consultation.expertToken) {
+          item.consultation.expertInvitationURL = getExpertInvitationURL(
+            item.consultation.expertToken,
+          );
+        }
         if (item.consultation.experts.length) {
           const experts = await User.find({
             id: { in: item.consultation.experts },
           });
           data[index].consultation.experts = experts;
-          sails.config.customLogger.log('verbose', `Processed experts for consultation ${item.consultation?.id} expertCount ${experts.length}`, null, 'message', req.user?.id);
+          sails.config.customLogger.log(
+            "verbose",
+            `Processed experts for consultation ${item.consultation?.id} expertCount ${experts.length}`,
+            null,
+            "message",
+            req.user?.id,
+          );
         }
 
         if (item.consultation.closedBy) {
-          const closedById = item.consultation.closedBy.toString ? item.consultation.closedBy.toString() : item.consultation.closedBy;
+          const closedById = item.consultation.closedBy.toString
+            ? item.consultation.closedBy.toString()
+            : item.consultation.closedBy;
           const closedByUser = await User.findOne({ id: closedById });
           if (closedByUser) {
             data[index].closedByUser = {
               firstName: closedByUser.firstName,
-              lastName: closedByUser.lastName
+              lastName: closedByUser.lastName,
             };
           }
         }
 
-        const ownerId = item.consultation.owner?.toString ? item.consultation.owner.toString() : item.consultation.owner;
-        const acceptedById = item.consultation.acceptedBy?.toString ? item.consultation.acceptedBy.toString() : item.consultation.acceptedBy;
+        const ownerId = item.consultation.owner?.toString
+          ? item.consultation.owner.toString()
+          : item.consultation.owner;
+        const acceptedById = item.consultation.acceptedBy?.toString
+          ? item.consultation.acceptedBy.toString()
+          : item.consultation.acceptedBy;
         if (ownerId && acceptedById && ownerId === acceptedById) {
           data[index].consultation.isSelfCallScenario = true;
-          sails.config.customLogger.log('info', `Self-call scenario detected for consultation ${item.consultation?.id}`, null, 'message', req.user?.id);
+          sails.config.customLogger.log(
+            "info",
+            `Self-call scenario detected for consultation ${item.consultation?.id}`,
+            null,
+            "message",
+            req.user?.id,
+          );
         }
       }
 
@@ -340,59 +544,93 @@ module.exports = {
 
       const hasKey = !!sails.config.globals.ENCRYPTION_KEY;
       const encryption = hasKey ? sails.helpers.encryption() : null;
-      const sensitiveFields = ['firstName', 'lastName', 'birthDate', 'note', 'patientComment', 'doctorComment'];
-      const inviteSensitiveFields = ['firstName', 'lastName', 'birthDate', 'phoneNumber', 'emailAddress', 'guestPhoneNumber', 'guestEmailAddress', 'note'];
+      const sensitiveFields = [
+        "firstName",
+        "lastName",
+        "birthDate",
+        "note",
+        "patientComment",
+        "doctorComment",
+      ];
+      const inviteSensitiveFields = [
+        "firstName",
+        "lastName",
+        "birthDate",
+        "phoneNumber",
+        "emailAddress",
+        "guestPhoneNumber",
+        "guestEmailAddress",
+        "note",
+      ];
       for (const item of data) {
-        if (item.lastMsg?.isEncrypted && item.lastMsg?.text && item.lastMsg?.type === 'text') {
+        if (
+          item.lastMsg?.isEncrypted &&
+          item.lastMsg?.text &&
+          item.lastMsg?.type === "text"
+        ) {
           if (hasKey) {
             item.lastMsg.text = encryption.decryptText(item.lastMsg.text);
           } else {
-            item.lastMsg.text = 'Message cannot be decrypted';
+            item.lastMsg.text = "Message cannot be decrypted";
           }
         }
         if (item.consultation?.isEncrypted) {
-          sensitiveFields.forEach(field => {
+          sensitiveFields.forEach((field) => {
             if (item.consultation[field]) {
               if (hasKey) {
-                item.consultation[field] = encryption.decryptText(item.consultation[field]);
+                item.consultation[field] = encryption.decryptText(
+                  item.consultation[field],
+                );
               } else {
-                item.consultation[field] = 'Cannot be decrypted';
+                item.consultation[field] = "Cannot be decrypted";
               }
             }
           });
-          if (item.consultation.metadata && typeof item.consultation.metadata === 'string') {
+          if (
+            item.consultation.metadata &&
+            typeof item.consultation.metadata === "string"
+          ) {
             if (hasKey) {
               try {
-                const decrypted = encryption.decryptText(item.consultation.metadata);
+                const decrypted = encryption.decryptText(
+                  item.consultation.metadata,
+                );
                 item.consultation.metadata = JSON.parse(decrypted);
               } catch (e) {
-                item.consultation.metadata = { error: 'Cannot be decrypted' };
+                item.consultation.metadata = { error: "Cannot be decrypted" };
               }
             } else {
-              item.consultation.metadata = { error: 'Cannot be decrypted' };
+              item.consultation.metadata = { error: "Cannot be decrypted" };
             }
           }
         }
         if (item.guestInvite?.isEncrypted) {
-          inviteSensitiveFields.forEach(field => {
+          inviteSensitiveFields.forEach((field) => {
             if (item.guestInvite[field]) {
               if (hasKey) {
-                item.guestInvite[field] = encryption.decryptText(item.guestInvite[field]);
+                item.guestInvite[field] = encryption.decryptText(
+                  item.guestInvite[field],
+                );
               } else {
-                item.guestInvite[field] = 'Cannot be decrypted';
+                item.guestInvite[field] = "Cannot be decrypted";
               }
             }
           });
-          if (item.guestInvite.metadata && typeof item.guestInvite.metadata === 'string') {
+          if (
+            item.guestInvite.metadata &&
+            typeof item.guestInvite.metadata === "string"
+          ) {
             if (hasKey) {
               try {
-                const decrypted = encryption.decryptText(item.guestInvite.metadata);
+                const decrypted = encryption.decryptText(
+                  item.guestInvite.metadata,
+                );
                 item.guestInvite.metadata = JSON.parse(decrypted);
               } catch (e) {
-                item.guestInvite.metadata = { error: 'Cannot be decrypted' };
+                item.guestInvite.metadata = { error: "Cannot be decrypted" };
               }
             } else {
-              item.guestInvite.metadata = { error: 'Cannot be decrypted' };
+              item.guestInvite.metadata = { error: "Cannot be decrypted" };
             }
           }
         }
@@ -400,9 +638,14 @@ module.exports = {
 
       res.json(data);
     } catch (err) {
-      sails.config.customLogger.log('error', 'Error in consultationOverview', { error: err?.message || err }, 'server-action', req.user?.id);
+      sails.config.customLogger.log(
+        "error",
+        "Error in consultationOverview",
+        { error: err?.message || err },
+        "server-action",
+        req.user?.id,
+      );
       return res.serverError(err);
-
     }
   },
 
@@ -427,22 +670,22 @@ module.exports = {
         },
         {
           $project: {
-            consultation: '$$ROOT',
+            consultation: "$$ROOT",
           },
         },
         {
           $lookup: {
-            from: 'message',
-            localField: '_id',
-            foreignField: 'consultation',
-            as: 'messages',
+            from: "message",
+            localField: "_id",
+            foreignField: "consultation",
+            as: "messages",
           },
         },
         {
           $project: {
             consultation: 1,
             lastMsg: {
-              $arrayElemAt: ['$messages', -1],
+              $arrayElemAt: ["$messages", -1],
             },
             messages: 1,
           },
@@ -453,20 +696,20 @@ module.exports = {
             lastMsg: 1,
             messages: {
               $filter: {
-                input: '$messages',
-                as: 'msg',
+                input: "$messages",
+                as: "msg",
                 cond: {
                   $and: [
                     {
-                      $eq: ['$$msg.read', false],
+                      $eq: ["$$msg.read", false],
                     },
                     {
                       $or: [
                         {
-                          $eq: ['$$msg.to', new ObjectId(req.user.id)],
+                          $eq: ["$$msg.to", new ObjectId(req.user.id)],
                         },
                         {
-                          $eq: ['$$msg.to', null],
+                          $eq: ["$$msg.to", null],
                         },
                       ],
                     },
@@ -481,72 +724,72 @@ module.exports = {
             consultation: 1,
             lastMsg: 1,
             unreadCount: {
-              $size: '$messages',
+              $size: "$messages",
             },
           },
         },
         {
           $lookup: {
-            from: 'user',
-            localField: 'consultation.owner',
-            foreignField: '_id',
-            as: 'nurse',
+            from: "user",
+            localField: "consultation.owner",
+            foreignField: "_id",
+            as: "nurse",
           },
         },
         {
           $lookup: {
-            from: 'queue',
-            localField: 'consultation.queue',
-            foreignField: '_id',
-            as: 'queue',
+            from: "queue",
+            localField: "consultation.queue",
+            foreignField: "_id",
+            as: "queue",
           },
         },
         {
           $lookup: {
-            from: 'user',
-            localField: 'consultation.acceptedBy',
-            foreignField: '_id',
-            as: 'doctor',
+            from: "user",
+            localField: "consultation.acceptedBy",
+            foreignField: "_id",
+            as: "doctor",
           },
         },
         {
           $lookup: {
-            from: 'user',
-            localField: 'consultation.translator',
-            foreignField: '_id',
-            as: 'translator',
+            from: "user",
+            localField: "consultation.translator",
+            foreignField: "_id",
+            as: "translator",
           },
         },
         {
           $lookup: {
-            from: 'user',
-            localField: 'consultation.guest',
-            foreignField: '_id',
-            as: 'guest',
+            from: "user",
+            localField: "consultation.guest",
+            foreignField: "_id",
+            as: "guest",
           },
         },
         {
           $lookup: {
-            from: 'publicinvite',
-            localField: 'consultation.guestInvite',
-            foreignField: '_id',
-            as: 'guestInvite',
+            from: "publicinvite",
+            localField: "consultation.guestInvite",
+            foreignField: "_id",
+            as: "guestInvite",
           },
         },
         {
           $lookup: {
-            from: 'user',
-            let: { expertIds: '$consultation.experts' },
+            from: "user",
+            let: { expertIds: "$consultation.experts" },
             pipeline: [
               {
                 $match: {
                   $expr: {
-                    $in: ['$_id', { $ifNull: ['$$expertIds', []] }]
-                  }
-                }
-              }
+                    $in: ["$_id", { $ifNull: ["$$expertIds", []] }],
+                  },
+                },
+              },
             ],
-            as: 'experts',
+            as: "experts",
           },
         },
         {
@@ -564,16 +807,16 @@ module.exports = {
             lastMsg: 1,
             unreadCount: 1,
             doctor: {
-              $arrayElemAt: ['$doctor', 0],
+              $arrayElemAt: ["$doctor", 0],
             },
             nurse: {
-              $arrayElemAt: ['$nurse', 0],
+              $arrayElemAt: ["$nurse", 0],
             },
             queue: {
-              $arrayElemAt: ['$queue', 0],
+              $arrayElemAt: ["$queue", 0],
             },
             guestInvite: {
-              $arrayElemAt: ['$guestInvite', 0],
+              $arrayElemAt: ["$guestInvite", 0],
             },
             experts: 1,
           },
@@ -583,29 +826,29 @@ module.exports = {
             consultation: 1,
             lastMsg: 1,
             unreadCount: 1,
-            'doctor.firstName': 1,
-            'doctor.lastName': 1,
-            'doctor.phoneNumber': 1,
-            'nurse.firstName': 1,
-            'nurse.lastName': 1,
-            'queue': 1,
+            "doctor.firstName": 1,
+            "doctor.lastName": 1,
+            "doctor.phoneNumber": 1,
+            "nurse.firstName": 1,
+            "nurse.lastName": 1,
+            queue: 1,
             guestInvite: 1,
             guest: {
-              $arrayElemAt: ['$guest', 0],
+              $arrayElemAt: ["$guest", 0],
             },
             translator: {
-              $arrayElemAt: ['$translator', 0],
+              $arrayElemAt: ["$translator", 0],
             },
             experts: 1,
             acceptedByUser: {
               $cond: {
-                if: { $ne: ['$doctor', null] },
+                if: { $ne: ["$doctor", null] },
                 then: {
-                  firstName: '$doctor.firstName',
-                  lastName: '$doctor.lastName'
+                  firstName: "$doctor.firstName",
+                  lastName: "$doctor.lastName",
                 },
-                else: null
-              }
+                else: null,
+              },
             },
           },
         },
@@ -617,40 +860,78 @@ module.exports = {
         },
       ];
 
-      sails.config.customLogger.log('info', 'Running consultations created by requester aggregation', null, 'message', req.user?.id);
+      sails.config.customLogger.log(
+        "info",
+        "Running consultations created by requester aggregation",
+        null,
+        "message",
+        req.user?.id,
+      );
 
-      const consultationCollection = db.collection('consultation');
+      const consultationCollection = db.collection("consultation");
       const results = await consultationCollection.aggregate(agg);
       const data = await results.toArray();
 
-      sails.config.customLogger.log('info', `Aggregation completed resultCount is ${data.length}`, null, 'message', req.user?.id);
+      sails.config.customLogger.log(
+        "info",
+        `Aggregation completed resultCount is ${data.length}`,
+        null,
+        "message",
+        req.user?.id,
+      );
 
       for (const index in data) {
         const item = data[index];
+        // Always rebuild the expert link from the stored expert token
+        // with the current EXPERT_URL/PUBLIC_URL (the stored URL is frozen at
+        // consultation creation time and may point to an outdated host/path).
+        if (item.consultation && item.consultation.expertToken) {
+          item.consultation.expertInvitationURL = getExpertInvitationURL(
+            item.consultation.expertToken,
+          );
+        }
         if (item.consultation.experts.length) {
           const experts = await User.find({
             id: { in: item.consultation.experts },
           });
           data[index].consultation.experts = experts;
-          sails.config.customLogger.log('verbose', `Processed experts for consultation ${item.consultation?.id} expertCount ${experts.length}`, null, 'message', req.user?.id);
+          sails.config.customLogger.log(
+            "verbose",
+            `Processed experts for consultation ${item.consultation?.id} expertCount ${experts.length}`,
+            null,
+            "message",
+            req.user?.id,
+          );
         }
 
         if (item.consultation.closedBy) {
-          const closedById = item.consultation.closedBy.toString ? item.consultation.closedBy.toString() : item.consultation.closedBy;
+          const closedById = item.consultation.closedBy.toString
+            ? item.consultation.closedBy.toString()
+            : item.consultation.closedBy;
           const closedByUser = await User.findOne({ id: closedById });
           if (closedByUser) {
             data[index].closedByUser = {
               firstName: closedByUser.firstName,
-              lastName: closedByUser.lastName
+              lastName: closedByUser.lastName,
             };
           }
         }
 
-        const ownerId = item.consultation.owner?.toString ? item.consultation.owner.toString() : item.consultation.owner;
-        const acceptedById = item.consultation.acceptedBy?.toString ? item.consultation.acceptedBy.toString() : item.consultation.acceptedBy;
+        const ownerId = item.consultation.owner?.toString
+          ? item.consultation.owner.toString()
+          : item.consultation.owner;
+        const acceptedById = item.consultation.acceptedBy?.toString
+          ? item.consultation.acceptedBy.toString()
+          : item.consultation.acceptedBy;
         if (ownerId && acceptedById && ownerId === acceptedById) {
           data[index].consultation.isSelfCallScenario = true;
-          sails.config.customLogger.log('info', `Self-call scenario detected for consultation ${item.consultation?.id}`, null, 'message', req.user?.id);
+          sails.config.customLogger.log(
+            "info",
+            `Self-call scenario detected for consultation ${item.consultation?.id}`,
+            null,
+            "message",
+            req.user?.id,
+          );
         }
       }
 
@@ -664,59 +945,93 @@ module.exports = {
 
       const hasKey = !!sails.config.globals.ENCRYPTION_KEY;
       const encryption = hasKey ? sails.helpers.encryption() : null;
-      const sensitiveFields = ['firstName', 'lastName', 'birthDate', 'note', 'patientComment', 'doctorComment'];
-      const inviteSensitiveFields = ['firstName', 'lastName', 'birthDate', 'phoneNumber', 'emailAddress', 'guestPhoneNumber', 'guestEmailAddress', 'note'];
+      const sensitiveFields = [
+        "firstName",
+        "lastName",
+        "birthDate",
+        "note",
+        "patientComment",
+        "doctorComment",
+      ];
+      const inviteSensitiveFields = [
+        "firstName",
+        "lastName",
+        "birthDate",
+        "phoneNumber",
+        "emailAddress",
+        "guestPhoneNumber",
+        "guestEmailAddress",
+        "note",
+      ];
       for (const item of data) {
-        if (item.lastMsg?.isEncrypted && item.lastMsg?.text && item.lastMsg?.type === 'text') {
+        if (
+          item.lastMsg?.isEncrypted &&
+          item.lastMsg?.text &&
+          item.lastMsg?.type === "text"
+        ) {
           if (hasKey) {
             item.lastMsg.text = encryption.decryptText(item.lastMsg.text);
           } else {
-            item.lastMsg.text = 'Message cannot be decrypted';
+            item.lastMsg.text = "Message cannot be decrypted";
           }
         }
         if (item.consultation?.isEncrypted) {
-          sensitiveFields.forEach(field => {
+          sensitiveFields.forEach((field) => {
             if (item.consultation[field]) {
               if (hasKey) {
-                item.consultation[field] = encryption.decryptText(item.consultation[field]);
+                item.consultation[field] = encryption.decryptText(
+                  item.consultation[field],
+                );
               } else {
-                item.consultation[field] = 'Cannot be decrypted';
+                item.consultation[field] = "Cannot be decrypted";
               }
             }
           });
-          if (item.consultation.metadata && typeof item.consultation.metadata === 'string') {
+          if (
+            item.consultation.metadata &&
+            typeof item.consultation.metadata === "string"
+          ) {
             if (hasKey) {
               try {
-                const decrypted = encryption.decryptText(item.consultation.metadata);
+                const decrypted = encryption.decryptText(
+                  item.consultation.metadata,
+                );
                 item.consultation.metadata = JSON.parse(decrypted);
               } catch (e) {
-                item.consultation.metadata = { error: 'Cannot be decrypted' };
+                item.consultation.metadata = { error: "Cannot be decrypted" };
               }
             } else {
-              item.consultation.metadata = { error: 'Cannot be decrypted' };
+              item.consultation.metadata = { error: "Cannot be decrypted" };
             }
           }
         }
         if (item.guestInvite?.isEncrypted) {
-          inviteSensitiveFields.forEach(field => {
+          inviteSensitiveFields.forEach((field) => {
             if (item.guestInvite[field]) {
               if (hasKey) {
-                item.guestInvite[field] = encryption.decryptText(item.guestInvite[field]);
+                item.guestInvite[field] = encryption.decryptText(
+                  item.guestInvite[field],
+                );
               } else {
-                item.guestInvite[field] = 'Cannot be decrypted';
+                item.guestInvite[field] = "Cannot be decrypted";
               }
             }
           });
-          if (item.guestInvite.metadata && typeof item.guestInvite.metadata === 'string') {
+          if (
+            item.guestInvite.metadata &&
+            typeof item.guestInvite.metadata === "string"
+          ) {
             if (hasKey) {
               try {
-                const decrypted = encryption.decryptText(item.guestInvite.metadata);
+                const decrypted = encryption.decryptText(
+                  item.guestInvite.metadata,
+                );
                 item.guestInvite.metadata = JSON.parse(decrypted);
               } catch (e) {
-                item.guestInvite.metadata = { error: 'Cannot be decrypted' };
+                item.guestInvite.metadata = { error: "Cannot be decrypted" };
               }
             } else {
-              item.guestInvite.metadata = { error: 'Cannot be decrypted' };
+              item.guestInvite.metadata = { error: "Cannot be decrypted" };
             }
           }
         }
@@ -724,7 +1039,13 @@ module.exports = {
 
       res.json(data);
     } catch (err) {
-      sails.config.customLogger.log('error', 'Error in consultationsCreatedByRequester', { error: err?.message || err }, 'server-action', req.user?.id);
+      sails.config.customLogger.log(
+        "error",
+        "Error in consultationsCreatedByRequester",
+        { error: err?.message || err },
+        "server-action",
+        req.user?.id,
+      );
       return res.serverError(err);
     }
   },
@@ -737,7 +1058,7 @@ module.exports = {
         queue: escapeHtml(req.body.queue),
         gender: escapeHtml(req.body.gender),
         IMADTeam: escapeHtml(req.body.IMADTeam),
-        invitationToken: escapeHtml(req.body.invitationToken || ''),
+        invitationToken: escapeHtml(req.body.invitationToken || ""),
         status: escapeHtml(req.body.status),
         owner: escapeHtml(req.body.owner),
         metadata: sanitizeMetadata(req.body.metadata),
@@ -745,14 +1066,24 @@ module.exports = {
       const { user } = req;
       let invite;
 
-      if (user.role === 'guest' || user.role === 'translator' || user.role === 'expert') {
+      if (
+        user.role === "guest" ||
+        user.role === "translator" ||
+        user.role === "expert"
+      ) {
         if (!req.body.invitationToken) {
-          sails.config.customLogger.log('info', `No invitationToken provided for ${user.role} userId ${user.id}`, null, 'message', user.id);
-          res.status(200).json({ message: 'OK' });
+          sails.config.customLogger.log(
+            "info",
+            `No invitationToken provided for ${user.role} userId ${user.id}`,
+            null,
+            "message",
+            user.id,
+          );
+          res.status(200).json({ message: "OK" });
         }
 
         let subInvite;
-        if (user.role === 'expert') {
+        if (user.role === "expert") {
           subInvite = await PublicInvite.findOne({
             expertToken: escapeHtml(req.body.invitationToken),
           });
@@ -763,16 +1094,28 @@ module.exports = {
         }
 
         if (!subInvite) {
-          sails.config.customLogger.log('warn', `Sub-invite not found for ${user.role} token ${req.body.invitationToken}`, null, 'message', user.id);
+          sails.config.customLogger.log(
+            "warn",
+            `Sub-invite not found for ${user.role} token ${req.body.invitationToken}`,
+            null,
+            "message",
+            user.id,
+          );
           return res.status(400).send();
         }
 
-        if (user.role === 'expert') {
+        if (user.role === "expert") {
           invite = subInvite;
         } else {
           invite = await PublicInvite.findOne({ id: subInvite.patientInvite });
           if (!invite) {
-            sails.config.customLogger.log('warn', `Invite not found for sub-invite ${subInvite.id}`, null, 'message', user.id);
+            sails.config.customLogger.log(
+              "warn",
+              `Invite not found for sub-invite ${subInvite.id}`,
+              null,
+              "message",
+              user.id,
+            );
             return res.status(400).send();
           }
         }
@@ -784,52 +1127,87 @@ module.exports = {
             invite: invite.id,
           });
 
-
           if (existingConsultation) {
-            sails.config.customLogger.log('info', `${user.role} joining existing consultation invite id ${invite.id} consultationId ${existingConsultation.id}`, null, 'message', user.id);
+            sails.config.customLogger.log(
+              "info",
+              `${user.role} joining existing consultation invite id ${invite.id} consultationId ${existingConsultation.id}`,
+              null,
+              "message",
+              user.id,
+            );
 
             const updateData = {};
-            if (user.role === 'guest' && !existingConsultation.guest) {
+            if (user.role === "guest" && !existingConsultation.guest) {
               updateData.guest = user.id;
             }
-            if (user.role === 'translator' && !existingConsultation.translator) {
+            if (
+              user.role === "translator" &&
+              !existingConsultation.translator
+            ) {
               updateData.translator = user.id;
             }
-            if (user.role === 'expert' && !existingConsultation.experts.includes(user.id)) {
+            if (
+              user.role === "expert" &&
+              !existingConsultation.experts.includes(user.id)
+            ) {
               existingConsultation.experts.push(user.id);
               updateData.experts = existingConsultation.experts;
             }
 
             if (Object.keys(updateData).length > 0) {
-              await Consultation.updateOne({ id: existingConsultation.id }).set(updateData);
-              sails.config.customLogger.log('info', `Updated consultation ${existingConsultation.id} with ${user.role} ${user.id}`, null, 'server-action', user.id);
-
-              const updatedConsultation = await Consultation.findOne({ id: existingConsultation.id });
-              const decryptedConsultation = Consultation.decryptForBroadcast(updatedConsultation);
-              (await Consultation.getConsultationParticipants(updatedConsultation)).forEach(
-                (participant) => {
-                  sails.config.customLogger.log('info', `Broadcasting consultation ${updatedConsultation.id} update for participant with MongoID: ${participant}`, null, 'server-action');
-                  sails.sockets.broadcast(participant, "consultationUpdated", {
-                    data: { consultation: decryptedConsultation },
-                  });
-                }
+              await Consultation.updateOne({ id: existingConsultation.id }).set(
+                updateData,
               );
+              sails.config.customLogger.log(
+                "info",
+                `Updated consultation ${existingConsultation.id} with ${user.role} ${user.id}`,
+                null,
+                "server-action",
+                user.id,
+              );
+
+              const updatedConsultation = await Consultation.findOne({
+                id: existingConsultation.id,
+              });
+              const decryptedConsultation =
+                Consultation.decryptForBroadcast(updatedConsultation);
+              (
+                await Consultation.getConsultationParticipants(
+                  updatedConsultation,
+                )
+              ).forEach((participant) => {
+                sails.config.customLogger.log(
+                  "info",
+                  `Broadcasting consultation ${updatedConsultation.id} update for participant with MongoID: ${participant}`,
+                  null,
+                  "server-action",
+                );
+                sails.sockets.broadcast(participant, "consultationUpdated", {
+                  data: { consultation: decryptedConsultation },
+                });
+              });
             }
 
             return res.status(200).json(existingConsultation);
           }
 
-          sails.config.customLogger.log('info', `${user.role} arrived first, creating consultation for invite id ${invite.id}`, null, 'message', user.id);
+          sails.config.customLogger.log(
+            "info",
+            `${user.role} arrived first, creating consultation for invite id ${invite.id}`,
+            null,
+            "message",
+            user.id,
+          );
           req.body.invitationToken = invite.inviteToken;
           consultationJson.invitationToken = invite.inviteToken;
 
-          if (user.role === 'guest') {
+          if (user.role === "guest") {
             consultationJson.guest = user.id;
           }
-          if (user.role === 'translator') {
+          if (user.role === "translator") {
             consultationJson.translator = user.id;
           }
-          if (user.role === 'expert') {
+          if (user.role === "expert") {
             consultationJson.experts = [user.id];
           }
         }
@@ -858,22 +1236,67 @@ module.exports = {
             invite: invite.id,
           });
           if (existingConsultation) {
-            sails.config.customLogger.log('info', `Found consultation by invite.id ${invite.id} consultationId ${existingConsultation.id}`, null, 'message', user.id);
+            sails.config.customLogger.log(
+              "info",
+              `Found consultation by invite.id ${invite.id} consultationId ${existingConsultation.id}`,
+              null,
+              "message",
+              user.id,
+            );
           }
         }
 
         if (existingConsultation) {
-          sails.config.customLogger.log('verbose', `Existing consultation found with invitationToken ${req.body.invitationToken} consultationId ${existingConsultation.id}`, null, 'message', user.id);
+          sails.config.customLogger.log(
+            "verbose",
+            `Existing consultation found with invitationToken ${req.body.invitationToken} consultationId ${existingConsultation.id}`,
+            null,
+            "message",
+            user.id,
+          );
 
           if (req.body.owner && !existingConsultation.owner) {
-            sails.config.customLogger.log('info', `Patient joining consultation created by guest/translator - setting owner to ${req.body.owner}`, null, 'server-action', user.id);
-            await Consultation.updateOne({ id: existingConsultation.id }).set({ owner: req.body.owner });
-            const updatedConsultation = await Consultation.findOne({ id: existingConsultation.id });
-            sails.config.customLogger.log('info', `Updated consultation ${existingConsultation.id} with owner ${req.body.owner}`, null, 'server-action', user.id);
+            sails.config.customLogger.log(
+              "info",
+              `Patient joining consultation created by guest/translator - setting owner to ${req.body.owner}`,
+              null,
+              "server-action",
+              user.id,
+            );
+            await Consultation.updateOne({ id: existingConsultation.id }).set({
+              owner: req.body.owner,
+            });
+            const updatedConsultation = await Consultation.findOne({
+              id: existingConsultation.id,
+            });
+            sails.config.customLogger.log(
+              "info",
+              `Updated consultation ${existingConsultation.id} with owner ${req.body.owner}`,
+              null,
+              "server-action",
+              user.id,
+            );
             return res.json(updatedConsultation);
           }
 
           return res.json(existingConsultation);
+        }
+
+        if (
+          user.role === "patient" &&
+          invite &&
+          ["CANCELED", "REFUSED", "COMPLETE"].includes(invite.status)
+        ) {
+          sails.config.customLogger.log(
+            "warn",
+            `Attempt to create consultation with ${invite.status} invite inviteId ${invite.id}`,
+            null,
+            "message",
+            user.id,
+          );
+          return res
+            .status(400)
+            .json({ success: false, message: "Invite is no longer valid" });
         }
 
         const isExpert = invite.expertToken === req.body.invitationToken;
@@ -881,48 +1304,75 @@ module.exports = {
           Consultation.update({ invitationToken: invite.inviteToken }, {})
             .fetch()
             .then((consultation) => {
-              sails.config.customLogger.log('info', `Returning consultation update for expert invite ${invite.inviteToken} consultation ${consultation?.[0]?.id}`, null, 'server-action', user?.id);
+              sails.config.customLogger.log(
+                "info",
+                `Returning consultation update for expert invite ${invite.inviteToken} consultation ${consultation?.[0]?.id}`,
+                null,
+                "server-action",
+                user?.id,
+              );
               res.json(consultation[0]);
             });
           return;
         }
 
         if (invite) {
-          if (invite.scheduledFor && (invite.scheduledFor - Date.now() > 10 * 60 * 1000)) {
-            sails.config.customLogger.log('warn', `Attempt to create consultation too early inviteId ${invite.id} scheduledFor ${invite.scheduledFor}`, null, 'message', user?.id);
-            return res.status(401).json({ success: false, message: 'Too early for consultation' });
+          if (
+            invite.scheduledFor &&
+            invite.scheduledFor - Date.now() > 10 * 60 * 1000
+          ) {
+            sails.config.customLogger.log(
+              "warn",
+              `Attempt to create consultation too early inviteId ${invite.id} scheduledFor ${invite.scheduledFor}`,
+              null,
+              "message",
+              user?.id,
+            );
+            return res
+              .status(401)
+              .json({ success: false, message: "Too early for consultation" });
           }
 
-          consultationJson.firstName = invite.firstName ? invite.firstName : 'No firstname';
-          consultationJson.lastName = invite.lastName ? invite.lastName : 'No lastname';
-          consultationJson.gender = invite.gender ? invite.gender : 'unknown';
+          consultationJson.firstName = invite.firstName
+            ? invite.firstName
+            : "No firstname";
+          consultationJson.lastName = invite.lastName
+            ? invite.lastName
+            : "No lastname";
+          consultationJson.gender = invite.gender ? invite.gender : "unknown";
           consultationJson.queue = invite.queue;
           consultationJson.doctor = invite.doctor;
           consultationJson.invite = invite.id;
           consultationJson.invitedBy = invite.invitedBy;
           consultationJson.metadata = invite.metadata; // Pass metadata from the invite to the consultation
           consultationJson.fhirData = invite.fhirData; // Pass FHIR data from the invite to the consultation
-          consultationJson.IMADTeam = invite.IMADTeam || 'none';
+          consultationJson.IMADTeam = invite.IMADTeam || "none";
           consultationJson.birthDate = invite.birthDate;
           consultationJson.note = invite.note;
-          consultationJson.expertInvitationURL = `${process.env.PUBLIC_URL}/inv/?invite=${invite.expertToken}`;
+          consultationJson.expertInvitationURL = getExpertInvitationURL(
+            invite.expertToken,
+          );
           consultationJson.expertToken = invite.expertToken;
           consultationJson.patientTZ = invite.patientTZ;
         }
       }
 
       if (invite) {
-        const subInvites = await PublicInvite.find({ patientInvite: invite.id });
+        const subInvites = await PublicInvite.find({
+          patientInvite: invite.id,
+        });
         if (subInvites.length) {
           const guest = await User.findOne({
             inviteToken: { in: subInvites.map((i) => i.id) },
-            role: 'guest',
+            role: "guest",
           });
-          const guestInvite = subInvites.find((i) => i.type === 'GUEST');
-          const translatorInvite = subInvites.find((i) => i.type === 'TRANSLATOR');
+          const guestInvite = subInvites.find((i) => i.type === "GUEST");
+          const translatorInvite = subInvites.find(
+            (i) => i.type === "TRANSLATOR",
+          );
           const translator = await User.findOne({
             inviteToken: { in: subInvites.map((i) => i.id) },
-            role: 'translator',
+            role: "translator",
           });
 
           if (guest) {
@@ -937,11 +1387,21 @@ module.exports = {
           if (translatorInvite) {
             consultationJson.translatorInvite = translatorInvite.id;
           }
-          sails.config.customLogger.log('info', `Processed sub-invites for consultation creation inviteId ${invite.id}`, null, 'message', user?.id);
+          sails.config.customLogger.log(
+            "info",
+            `Processed sub-invites for consultation creation inviteId ${invite.id}`,
+            null,
+            "message",
+            user?.id,
+          );
         }
       }
 
-      if (req.user && (req.user.role === sails.config.globals.ROLE_NURSE || req.user.role === sails.config.globals.ROLE_ADMIN)) {
+      if (
+        req.user &&
+        (req.user.role === sails.config.globals.ROLE_NURSE ||
+          req.user.role === sails.config.globals.ROLE_ADMIN)
+      ) {
         const inviteData = {
           firstName: req.body.firstName,
           lastName: req.body.lastName,
@@ -954,35 +1414,88 @@ module.exports = {
         consultationJson.id = newInvite.id;
         consultationJson.invitationToken = newInvite.inviteToken;
         consultationJson.expertToken = newInvite.expertToken;
-        consultationJson.expertInvitationURL = `${process.env.PUBLIC_URL}/inv/?invite=${newInvite.expertToken}`;
-        sails.config.customLogger.log('info', `New invite created by nurse ${newInvite.id}`, null, 'server-action');
+        consultationJson.expertInvitationURL = getExpertInvitationURL(
+          newInvite.expertToken,
+        );
+        sails.config.customLogger.log(
+          "info",
+          `New invite created by nurse ${newInvite.id}`,
+          null,
+          "server-action",
+        );
       }
 
-      const newConsultation = await Consultation.create(consultationJson).fetch();
-      sails.config.customLogger.log('info', `Consultation created ${newConsultation.id}`, null, 'server-action', user?.id);
+      const newConsultation =
+        await Consultation.create(consultationJson).fetch();
+      sails.config.customLogger.log(
+        "info",
+        `Consultation created ${newConsultation.id}`,
+        null,
+        "server-action",
+        user?.id,
+      );
 
       await Consultation.changeOnlineStatus(req.user, true);
 
       if (!req.body.invitationToken && process.env.DEFAULT_QUEUE_ID) {
-        await Consultation.sendPatientReadyToQueue(newConsultation, process.env.DEFAULT_QUEUE_ID);
-        sails.config.customLogger.log('info', `Patient ready notification sent to default queue consultationId ${newConsultation.id} queueId ${process.env.DEFAULT_QUEUE_ID}`, null, 'server-action', user?.id);
+        await Consultation.sendPatientReadyToQueue(
+          newConsultation,
+          process.env.DEFAULT_QUEUE_ID,
+        );
+        sails.config.customLogger.log(
+          "info",
+          `Patient ready notification sent to default queue consultationId ${newConsultation.id} queueId ${process.env.DEFAULT_QUEUE_ID}`,
+          null,
+          "server-action",
+          user?.id,
+        );
       } else if (!req.body.invitationToken && newConsultation.queue) {
-        await Consultation.sendPatientReadyToQueue(newConsultation, newConsultation.queue);
-        sails.config.customLogger.log('info', `Patient ready notification sent to consultation queue consultationId ${newConsultation.id} queueId ${newConsultation.queue}`, null, 'server-action', user?.id);
+        await Consultation.sendPatientReadyToQueue(
+          newConsultation,
+          newConsultation.queue,
+        );
+        sails.config.customLogger.log(
+          "info",
+          `Patient ready notification sent to consultation queue consultationId ${newConsultation.id} queueId ${newConsultation.queue}`,
+          null,
+          "server-action",
+          user?.id,
+        );
       } else {
         if (invite && invite.queue && !invite.doctor) {
-          await Consultation.sendPatientReadyToQueue(newConsultation, invite.queue);
-          sails.config.customLogger.log('info', `Patient ready notification sent based on invite queue consultationId ${newConsultation.id} queueId ${invite.queue}`, null, 'server-action', user?.id);
+          await Consultation.sendPatientReadyToQueue(
+            newConsultation,
+            invite.queue,
+          );
+          sails.config.customLogger.log(
+            "info",
+            `Patient ready notification sent based on invite queue consultationId ${newConsultation.id} queueId ${invite.queue}`,
+            null,
+            "server-action",
+            user?.id,
+          );
         } else if (invite?.doctor) {
           const doctor = await User.findOne({ id: invite.doctor });
           await Consultation.sendPatientReadyToDoctor(newConsultation, doctor);
-          sails.config.customLogger.log('info', `Patient ready notification sent to doctor based on invite consultationId ${newConsultation.id} doctorId ${doctor.id}`, null, 'server-action', user?.id);
+          sails.config.customLogger.log(
+            "info",
+            `Patient ready notification sent to doctor based on invite consultationId ${newConsultation.id} doctorId ${doctor.id}`,
+            null,
+            "server-action",
+            user?.id,
+          );
         }
       }
 
       return res.json(newConsultation);
     } catch (err) {
-      sails.config.customLogger.log('error', 'Error while creating consultation', { error: err?.message || err }, 'server-action', req.user?.id);
+      sails.config.customLogger.log(
+        "error",
+        "Error while creating consultation",
+        { error: err?.message || err },
+        "server-action",
+        req.user?.id,
+      );
       const error = err && err.cause ? err.cause : err;
       return res.status(400).json(error);
     }
@@ -994,88 +1507,123 @@ module.exports = {
       const newOwnerId = req.user.id;
 
       const consultation = await Consultation.findOne({ id: consultationId })
-        .populate('queue')
-        .populate('acceptedBy');
+        .populate("queue")
+        .populate("acceptedBy");
 
       if (!consultation) {
-        return res.notFound({ error: 'Consultation not found' });
+        return res.notFound({ error: "Consultation not found" });
       }
 
       if (!consultation.queue || !consultation.queue.shareWhenOpened) {
-        return res.forbidden({ error: 'Ownership transfer not allowed for this consultation' });
+        return res.forbidden({
+          error: "Ownership transfer not allowed for this consultation",
+        });
       }
 
-      if (consultation.status !== 'active') {
-        return res.badRequest({ error: 'Can only transfer ownership of active consultations' });
+      if (consultation.status !== "active") {
+        return res.badRequest({
+          error: "Can only transfer ownership of active consultations",
+        });
       }
 
-      if (consultation.acceptedBy && consultation.acceptedBy.id === newOwnerId) {
-        return res.badRequest({ error: 'You are already the owner of this consultation' });
+      if (
+        consultation.acceptedBy &&
+        consultation.acceptedBy.id === newOwnerId
+      ) {
+        return res.badRequest({
+          error: "You are already the owner of this consultation",
+        });
       }
 
       const previousOwner = consultation.acceptedBy;
 
       await Consultation.updateOne({ id: consultationId }).set({
         acceptedBy: newOwnerId,
-        acceptedAt: new Date()
+        acceptedAt: new Date(),
       });
 
       const newOwner = await User.findOne({ id: newOwnerId });
 
-      const locale = newOwner.preferredLanguage || process.env.DEFAULT_DOCTOR_LOCALE || 'en';
+      const locale =
+        newOwner.preferredLanguage || process.env.DEFAULT_DOCTOR_LOCALE || "en";
 
-      const previousOwnerName = previousOwner ? `${previousOwner.firstName} ${previousOwner.lastName}` : sails._t(locale, 'ownership unassigned');
+      const previousOwnerName = previousOwner
+        ? `${previousOwner.firstName} ${previousOwner.lastName}`
+        : sails._t(locale, "ownership unassigned");
       const newOwnerName = `${newOwner.firstName} ${newOwner.lastName}`;
 
       const message = await Message.create({
-        type: 'ownershipTransfer',
+        type: "ownershipTransfer",
         consultation: consultationId,
         from: newOwnerId,
-        text: sails._t(locale, 'ownership transfer message', { previousOwner: previousOwnerName, newOwner: newOwnerName }),
+        text: sails._t(locale, "ownership transfer message", {
+          previousOwner: previousOwnerName,
+          newOwner: newOwnerName,
+        }),
         metadata: {
-          previousOwner: previousOwner ? {
-            id: previousOwner.id,
-            firstName: previousOwner.firstName,
-            lastName: previousOwner.lastName
-          } : null,
+          previousOwner: previousOwner
+            ? {
+                id: previousOwner.id,
+                firstName: previousOwner.firstName,
+                lastName: previousOwner.lastName,
+              }
+            : null,
           newOwner: {
             id: newOwner.id,
             firstName: newOwner.firstName,
-            lastName: newOwner.lastName
-          }
-        }
+            lastName: newOwner.lastName,
+          },
+        },
       }).fetch();
 
-      const updatedConsultation = await Consultation.findOne({ id: consultationId })
-        .populate('owner')
-        .populate('acceptedBy')
-        .populate('queue');
+      const updatedConsultation = await Consultation.findOne({
+        id: consultationId,
+      })
+        .populate("owner")
+        .populate("acceptedBy")
+        .populate("queue");
 
-      const participants = await Consultation.getConsultationParticipants(updatedConsultation);
-      const decryptedConsultation = Consultation.decryptForBroadcast(updatedConsultation);
-      participants.forEach(participantId => {
-        sails.sockets.broadcast(participantId, 'ownershipTransferred', {
+      const participants =
+        await Consultation.getConsultationParticipants(updatedConsultation);
+      const decryptedConsultation =
+        Consultation.decryptForBroadcast(updatedConsultation);
+      participants.forEach((participantId) => {
+        sails.sockets.broadcast(participantId, "ownershipTransferred", {
           data: {
             consultation: decryptedConsultation,
             previousOwner: previousOwner,
-            newOwner: newOwner
-          }
+            newOwner: newOwner,
+          },
         });
       });
 
-      sails.config.customLogger.log('info', `Ownership transferred for consultation ${consultationId} from ${previousOwner?.id} to ${newOwnerId}`, null, 'server-action', req.user?.id);
+      sails.config.customLogger.log(
+        "info",
+        `Ownership transferred for consultation ${consultationId} from ${previousOwner?.id} to ${newOwnerId}`,
+        null,
+        "server-action",
+        req.user?.id,
+      );
 
       return res.json({
         consultation: updatedConsultation,
-        message: message
+        message: message,
       });
-
     } catch (error) {
-      sails.config.customLogger.log('error', 'Error transferring ownership', {
-        consultationId: req.params.consultation,
-        error: error?.message || error
-      }, 'server-action', req.user?.id);
-      return res.serverError({ error: 'Error transferring ownership', details: error.message });
+      sails.config.customLogger.log(
+        "error",
+        "Error transferring ownership",
+        {
+          consultationId: req.params.consultation,
+          error: error?.message || error,
+        },
+        "server-action",
+        req.user?.id,
+      );
+      return res.serverError({
+        error: "Error transferring ownership",
+        details: error.message,
+      });
     }
   },
 
@@ -1083,47 +1631,73 @@ module.exports = {
     try {
       const consultation = await Consultation.updateOne({
         id: req.params.consultation,
-        status: 'pending'
+        status: "pending",
       }).set({
-        status: 'active',
+        status: "active",
         acceptedBy: req.user.id,
-        acceptedAt: new Date()
+        acceptedAt: new Date(),
       });
 
       if (!consultation) {
-        sails.config.customLogger.log('warn', `Consultation with id ${req.params.consultation} not found or not pending`, null, 'message', req.user.id);
+        sails.config.customLogger.log(
+          "warn",
+          `Consultation with id ${req.params.consultation} not found or not pending`,
+          null,
+          "message",
+          req.user.id,
+        );
         return res.notFound();
       }
 
-      sails.config.customLogger.log('info', `Consultation ${consultation.id} accepted by doctor ${req.user.id}`, null, 'server-action', req.user.id);
+      sails.config.customLogger.log(
+        "info",
+        `Consultation ${consultation.id} accepted by doctor ${req.user.id}`,
+        null,
+        "server-action",
+        req.user.id,
+      );
 
-      const participants = await Consultation.getConsultationParticipants(consultation);
-      const decryptedConsultation = Consultation.decryptForBroadcast(consultation);
+      const participants =
+        await Consultation.getConsultationParticipants(consultation);
+      const decryptedConsultation =
+        Consultation.decryptForBroadcast(consultation);
       participants.forEach((participant) => {
-        sails.sockets.broadcast(participant, 'consultationAccepted', {
+        sails.sockets.broadcast(participant, "consultationAccepted", {
           data: {
             consultation: decryptedConsultation,
             _id: consultation.id,
             doctor: {
               firstName: req.user.firstName,
               lastName: req.user.lastName,
-              phoneNumber: req.user.phoneNumber ? req.user.phoneNumber : ''
-            }
-          }
+              phoneNumber: req.user.phoneNumber ? req.user.phoneNumber : "",
+            },
+          },
         });
-        sails.config.customLogger.log('info', `Broadcast consultationAccepted event to participant ${participant} consultationId ${consultation.id}`, null, 'server-action', req.user.id);
+        sails.config.customLogger.log(
+          "info",
+          `Broadcast consultationAccepted event to participant ${participant} consultationId ${consultation.id}`,
+          null,
+          "server-action",
+          req.user.id,
+        );
       });
       await Consultation.changeOnlineStatus(req.user, true);
 
       return res.status(200).json({
-        message: 'success'
+        message: "success",
       });
     } catch (err) {
-      sails.config.customLogger.log('error', 'Error accepting consultation', {
-        consultationId: req.params.consultation,
-        error: err?.message || err
-      }, 'server-action', req.user?.id);
-      return res.serverError({ error: 'Error accepting consultation' });
+      sails.config.customLogger.log(
+        "error",
+        "Error accepting consultation",
+        {
+          consultationId: req.params.consultation,
+          error: err?.message || err,
+        },
+        "server-action",
+        req.user?.id,
+      );
+      return res.serverError({ error: "Error accepting consultation" });
     }
   },
 
@@ -1132,50 +1706,103 @@ module.exports = {
     try {
       const { user } = req;
       const consultation = await Consultation.findOne({ id: consultationId });
-      if (!consultation || consultation.status !== 'active') {
-        sails.config.customLogger.log('warn', `Consultation ${consultationId} not found or not active for closure`, null, 'message', user?.id);
-        const anonymousConsultation = await AnonymousConsultation.find({ consultationId: consultationId });
+      if (!consultation || consultation.status !== "active") {
+        sails.config.customLogger.log(
+          "warn",
+          `Consultation ${consultationId} not found or not active for closure`,
+          null,
+          "message",
+          user?.id,
+        );
+        const anonymousConsultation = await AnonymousConsultation.find({
+          consultationId: consultationId,
+        });
         if (anonymousConsultation) {
-          sails.config.customLogger.log('info', `Returning anonymous consultation data consultationId ${consultationId}`, null, 'server-action', user?.id);
+          sails.config.customLogger.log(
+            "info",
+            `Returning anonymous consultation data consultationId ${consultationId}`,
+            null,
+            "server-action",
+            user?.id,
+          );
           return res.status(200).json(anonymousConsultation);
         } else {
-          sails.config.customLogger.log('warn', `Anonymous consultation with id ${consultationId} not found`, null, 'message', user?.id);
+          sails.config.customLogger.log(
+            "warn",
+            `Anonymous consultation with id ${consultationId} not found`,
+            null,
+            "message",
+            user?.id,
+          );
           return res.notFound();
         }
       }
 
       const selector = {
         consultation: consultationId,
-        type: { in: ['videoCall', 'audioCall'] },
-        status: { in: ['ringing', 'ongoing'] },
+        type: { in: ["videoCall", "audioCall"] },
+        status: { in: ["ringing", "ongoing"] },
       };
 
-      sails.config.customLogger.log('info', `Searching for ongoing calls for ${consultationId}`, null, 'message', user?.id);
+      sails.config.customLogger.log(
+        "info",
+        `Searching for ongoing calls for ${consultationId}`,
+        null,
+        "message",
+        user?.id,
+      );
       const [call] = await Message.find({
         where: selector,
-        sort: [{ createdAt: 'DESC' }],
+        sort: [{ createdAt: "DESC" }],
       }).limit(1);
 
       if (call) {
-        sails.config.customLogger.log('info', `Ongoing call found, ending call callId ${call.id} consultationId ${consultationId}`, null, 'server-action', user?.id);
-        await Message.endCall(call, consultation, 'CONSULTATION_CLOSED');
+        sails.config.customLogger.log(
+          "info",
+          `Ongoing call found, ending call callId ${call.id} consultationId ${consultationId}`,
+          null,
+          "server-action",
+          user?.id,
+        );
+        await Message.endCall(call, consultation, "CONSULTATION_CLOSED");
       } else {
-        sails.config.customLogger.log('info', `No ongoing call found for consultation ${consultationId}`, null, 'server-action', user?.id);
+        sails.config.customLogger.log(
+          "info",
+          `No ongoing call found for consultation ${consultationId}`,
+          null,
+          "server-action",
+          user?.id,
+        );
       }
 
       await Consultation.updateOne({ id: consultationId }).set({
-        closedBy: req.user.id
+        closedBy: req.user.id,
       });
 
       await Consultation.closeConsultation(consultation, req.user?.id);
-      sails.config.customLogger.log('info', `Consultation ${consultation.id} closed successfully`, null, 'server-action', user?.id);
+      sails.config.customLogger.log(
+        "info",
+        `Consultation ${consultation.id} closed successfully`,
+        null,
+        "server-action",
+        user?.id,
+      );
       return res.status(200).json(consultation);
     } catch (error) {
-      sails.config.customLogger.log('error', 'Error closing consultation', {
-        consultationId: consultationId,
-        error: error?.message || error
-      }, 'server-action', req.user?.id);
-      return res.serverError({ error: 'Error closing consultation', details: error.message });
+      sails.config.customLogger.log(
+        "error",
+        "Error closing consultation",
+        {
+          consultationId: consultationId,
+          error: error?.message || error,
+        },
+        "server-action",
+        req.user?.id,
+      );
+      return res.serverError({
+        error: "Error closing consultation",
+        details: error.message,
+      });
     }
   },
 
@@ -1185,158 +1812,344 @@ module.exports = {
       const { user } = req;
       const { scheduledFor, patientTZ } = req.body;
 
-      sails.config.customLogger.log('info', `rescheduleConsultation: Starting reschedule for consultation ${consultationId}`, null, 'message', user?.id);
+      sails.config.customLogger.log(
+        "info",
+        `rescheduleConsultation: Starting reschedule for consultation ${consultationId}`,
+        null,
+        "message",
+        user?.id,
+      );
 
       const consultation = await Consultation.findOne({ id: consultationId });
 
       if (!consultation) {
-        sails.config.customLogger.log('warn', `rescheduleConsultation: Consultation ${consultationId} not found`, null, 'message', user?.id);
-        return res.status(404).json({ error: 'Consultation not found' });
+        sails.config.customLogger.log(
+          "warn",
+          `rescheduleConsultation: Consultation ${consultationId} not found`,
+          null,
+          "message",
+          user?.id,
+        );
+        return res.status(404).json({ error: "Consultation not found" });
       }
 
-      if (consultation.status !== 'active') {
-        sails.config.customLogger.log('warn', `rescheduleConsultation: Consultation ${consultationId} is not active (status: ${consultation.status})`, null, 'message', user?.id);
-        return res.status(400).json({ error: 'Only active consultations can be rescheduled' });
+      if (consultation.status !== "active") {
+        sails.config.customLogger.log(
+          "warn",
+          `rescheduleConsultation: Consultation ${consultationId} is not active (status: ${consultation.status})`,
+          null,
+          "message",
+          user?.id,
+        );
+        return res
+          .status(400)
+          .json({ error: "Only active consultations can be rescheduled" });
       }
 
       if (!scheduledFor || !moment(scheduledFor).isValid()) {
-        sails.config.customLogger.log('warn', 'rescheduleConsultation: Invalid scheduledFor provided', null, 'message', user?.id);
-        return res.status(400).json({ error: 'Valid scheduledFor is required' });
+        sails.config.customLogger.log(
+          "warn",
+          "rescheduleConsultation: Invalid scheduledFor provided",
+          null,
+          "message",
+          user?.id,
+        );
+        return res
+          .status(400)
+          .json({ error: "Valid scheduledFor is required" });
       }
 
       const scheduledTimeUTC = patientTZ
-        ? moment.tz(scheduledFor, 'UTC').valueOf()
+        ? moment.tz(scheduledFor, "UTC").valueOf()
         : new Date(scheduledFor).getTime();
 
       if (scheduledTimeUTC < Date.now()) {
-        sails.config.customLogger.log('warn', 'rescheduleConsultation: Scheduled time is in the past', null, 'message', user?.id);
-        return res.status(400).json({ error: 'Scheduled time must be in the future' });
+        sails.config.customLogger.log(
+          "warn",
+          "rescheduleConsultation: Scheduled time is in the past",
+          null,
+          "message",
+          user?.id,
+        );
+        return res
+          .status(400)
+          .json({ error: "Scheduled time must be in the future" });
       }
 
       if (!consultation.invitationToken) {
-        sails.config.customLogger.log('warn', `rescheduleConsultation: Consultation ${consultationId} has no invitationToken - cannot reschedule`, null, 'message', user?.id);
-        return res.status(400).json({ error: 'This consultation cannot be rescheduled (no invitation token)' });
+        sails.config.customLogger.log(
+          "warn",
+          `rescheduleConsultation: Consultation ${consultationId} has no invitationToken - cannot reschedule`,
+          null,
+          "message",
+          user?.id,
+        );
+        return res
+          .status(400)
+          .json({
+            error:
+              "This consultation cannot be rescheduled (no invitation token)",
+          });
       }
 
-      const invite = await PublicInvite.findOne({ inviteToken: consultation.invitationToken }).populate('doctor');
+      const invite = await PublicInvite.findOne({
+        inviteToken: consultation.invitationToken,
+      }).populate("doctor");
 
       if (!invite) {
-        sails.config.customLogger.log('error', `rescheduleConsultation: Invite not found for active consultation ${consultationId} with token ${consultation.invitationToken}`, null, 'message', user?.id);
-        return res.status(500).json({ error: 'Invite not found for active consultation - this should not happen' });
+        sails.config.customLogger.log(
+          "error",
+          `rescheduleConsultation: Invite not found for active consultation ${consultationId} with token ${consultation.invitationToken}`,
+          null,
+          "message",
+          user?.id,
+        );
+        return res
+          .status(500)
+          .json({
+            error:
+              "Invite not found for active consultation - this should not happen",
+          });
       }
 
-      sails.config.customLogger.log('info', `rescheduleConsultation: Found invite ${invite.id} - email: ${invite.emailAddress || 'none'}, phone: ${invite.phoneNumber || 'none'}, messageService: ${invite.messageService}`, null, 'message', user?.id);
+      sails.config.customLogger.log(
+        "info",
+        `rescheduleConsultation: Found invite ${invite.id} - email: ${invite.emailAddress || "none"}, phone: ${invite.phoneNumber || "none"}, messageService: ${invite.messageService}`,
+        null,
+        "message",
+        user?.id,
+      );
 
       const oldScheduledFor = consultation.scheduledFor;
-      const formattedOldTime = oldScheduledFor ? moment(oldScheduledFor).tz(patientTZ || 'UTC').format('YYYY-MM-DD HH:mm:ss') : 'none';
-      const formattedNewTime = moment(scheduledTimeUTC).tz(patientTZ || 'UTC').format('YYYY-MM-DD HH:mm:ss');
-      sails.config.customLogger.log('info', `rescheduleConsultation: Rescheduling from ${formattedOldTime} to ${formattedNewTime} (${patientTZ || 'UTC'})`, null, 'message', user?.id);
+      const formattedOldTime = oldScheduledFor
+        ? moment(oldScheduledFor)
+            .tz(patientTZ || "UTC")
+            .format("YYYY-MM-DD HH:mm:ss")
+        : "none";
+      const formattedNewTime = moment(scheduledTimeUTC)
+        .tz(patientTZ || "UTC")
+        .format("YYYY-MM-DD HH:mm:ss");
+      sails.config.customLogger.log(
+        "info",
+        `rescheduleConsultation: Rescheduling from ${formattedOldTime} to ${formattedNewTime} (${patientTZ || "UTC"})`,
+        null,
+        "message",
+        user?.id,
+      );
 
       await Consultation.updateOne({ id: consultationId }).set({
         scheduledFor: scheduledTimeUTC,
-        patientTZ: patientTZ || consultation.patientTZ || invite.patientTZ || 'UTC'
+        patientTZ:
+          patientTZ || consultation.patientTZ || invite.patientTZ || "UTC",
       });
-      sails.config.customLogger.log('info', `rescheduleConsultation: Updated consultation ${consultationId} with new scheduledFor`, null, 'server-action', user?.id);
+      sails.config.customLogger.log(
+        "info",
+        `rescheduleConsultation: Updated consultation ${consultationId} with new scheduledFor`,
+        null,
+        "server-action",
+        user?.id,
+      );
 
       await PublicInvite.updateOne({ id: invite.id }).set({
         scheduledFor: scheduledTimeUTC,
-        patientTZ: patientTZ || invite.patientTZ || 'UTC',
-        status: 'SCHEDULED_FOR_INVITE',
+        patientTZ: patientTZ || invite.patientTZ || "UTC",
+        status: "SCHEDULED_FOR_INVITE",
       });
-      sails.config.customLogger.log('info', `rescheduleConsultation: Updated invite ${invite.id} with new scheduledFor and reset status`, null, 'server-action', user?.id);
+      sails.config.customLogger.log(
+        "info",
+        `rescheduleConsultation: Updated invite ${invite.id} with new scheduledFor and reset status`,
+        null,
+        "server-action",
+        user?.id,
+      );
 
-      const updatedInvite = await PublicInvite.findOne({ id: invite.id }).populate('doctor');
+      const updatedInvite = await PublicInvite.findOne({
+        id: invite.id,
+      }).populate("doctor");
 
       try {
-        sails.config.customLogger.log('info', `rescheduleConsultation: Sending reschedule notification for invite ${invite.id}`, null, 'message', user?.id);
+        sails.config.customLogger.log(
+          "info",
+          `rescheduleConsultation: Sending reschedule notification for invite ${invite.id}`,
+          null,
+          "message",
+          user?.id,
+        );
         await PublicInvite.sendPatientInvite(updatedInvite, true, user?.id);
-        sails.config.customLogger.log('info', `rescheduleConsultation: Sent reschedule notification for invite ${invite.id}`, null, 'server-action', user?.id);
+        sails.config.customLogger.log(
+          "info",
+          `rescheduleConsultation: Sent reschedule notification for invite ${invite.id}`,
+          null,
+          "server-action",
+          user?.id,
+        );
       } catch (error) {
-        sails.config.customLogger.log('error', 'rescheduleConsultation: Error sending notification', {
-          error: error?.message || error,
-          inviteId: invite.id
-        }, 'server-action', user?.id);
+        sails.config.customLogger.log(
+          "error",
+          "rescheduleConsultation: Error sending notification",
+          {
+            error: error?.message || error,
+            inviteId: invite.id,
+          },
+          "server-action",
+          user?.id,
+        );
       }
 
       try {
-        sails.config.customLogger.log('info', `rescheduleConsultation: Scheduling new reminders for invite ${invite.id}`, null, 'message', user?.id);
+        sails.config.customLogger.log(
+          "info",
+          `rescheduleConsultation: Scheduling new reminders for invite ${invite.id}`,
+          null,
+          "message",
+          user?.id,
+        );
         await PublicInvite.setPatientOrGuestInviteReminders(updatedInvite);
-        sails.config.customLogger.log('info', `rescheduleConsultation: Scheduled new reminders for invite ${invite.id}`, null, 'server-action', user?.id);
+        sails.config.customLogger.log(
+          "info",
+          `rescheduleConsultation: Scheduled new reminders for invite ${invite.id}`,
+          null,
+          "server-action",
+          user?.id,
+        );
       } catch (error) {
-        sails.config.customLogger.log('error', 'rescheduleConsultation: Error scheduling reminders', {
-          error: error?.message || error,
-          inviteId: invite.id
-        }, 'server-action', user?.id);
+        sails.config.customLogger.log(
+          "error",
+          "rescheduleConsultation: Error scheduling reminders",
+          {
+            error: error?.message || error,
+            inviteId: invite.id,
+          },
+          "server-action",
+          user?.id,
+        );
       }
 
       const subInvites = await PublicInvite.find({ patientInvite: invite.id });
-      const guestInvite = subInvites.find((i) => i.type === 'GUEST');
+      const guestInvite = subInvites.find((i) => i.type === "GUEST");
 
       if (guestInvite) {
         try {
-          sails.config.customLogger.log('info', `rescheduleConsultation: Updating guest invite ${guestInvite.id}`, null, 'message', user?.id);
+          sails.config.customLogger.log(
+            "info",
+            `rescheduleConsultation: Updating guest invite ${guestInvite.id}`,
+            null,
+            "message",
+            user?.id,
+          );
           await PublicInvite.updateOne({ id: guestInvite.id }).set({
             scheduledFor: scheduledTimeUTC,
-            patientTZ: patientTZ || guestInvite.patientTZ || 'UTC',
-            status: 'SCHEDULED_FOR_INVITE',
+            patientTZ: patientTZ || guestInvite.patientTZ || "UTC",
+            status: "SCHEDULED_FOR_INVITE",
           });
 
-          const updatedGuestInvite = await PublicInvite.findOne({ id: guestInvite.id }).populate('doctor');
-          await PublicInvite.sendGuestInvite(updatedGuestInvite, true, user?.id);
-          await PublicInvite.setPatientOrGuestInviteReminders(updatedGuestInvite);
-          sails.config.customLogger.log('info', `rescheduleConsultation: Rescheduled guest invite ${guestInvite.id}`, null, 'server-action', user?.id);
+          const updatedGuestInvite = await PublicInvite.findOne({
+            id: guestInvite.id,
+          }).populate("doctor");
+          await PublicInvite.sendGuestInvite(
+            updatedGuestInvite,
+            true,
+            user?.id,
+          );
+          await PublicInvite.setPatientOrGuestInviteReminders(
+            updatedGuestInvite,
+          );
+          sails.config.customLogger.log(
+            "info",
+            `rescheduleConsultation: Rescheduled guest invite ${guestInvite.id}`,
+            null,
+            "server-action",
+            user?.id,
+          );
         } catch (error) {
-          sails.config.customLogger.log('error', 'rescheduleConsultation: Error handling guest invite', {
-            error: error?.message || error,
-            guestInviteId: guestInvite.id
-          }, 'server-action', user?.id);
+          sails.config.customLogger.log(
+            "error",
+            "rescheduleConsultation: Error handling guest invite",
+            {
+              error: error?.message || error,
+              guestInviteId: guestInvite.id,
+            },
+            "server-action",
+            user?.id,
+          );
         }
       }
 
       try {
-        const rescheduleMessageText = sails._t('en', 'doctor rescheduled call', {
-          scheduledTime: formattedNewTime,
-          timezone: patientTZ || 'UTC'
-        });
+        const rescheduleMessageText = sails._t(
+          "en",
+          "doctor rescheduled call",
+          {
+            scheduledTime: formattedNewTime,
+            timezone: patientTZ || "UTC",
+          },
+        );
 
         const msg = await Message.create({
           consultation: consultationId,
           from: user.id,
           text: rescheduleMessageText,
-          type: 'text'
+          type: "text",
         }).fetch();
 
-        sails.sockets.broadcast(user.id, 'newMessage', { data: msg });
+        sails.sockets.broadcast(user.id, "newMessage", { data: msg });
 
-        sails.config.customLogger.log('info', `rescheduleConsultation: Created chat message about reschedule messageId ${msg.id}`, null, 'server-action', user?.id);
+        sails.config.customLogger.log(
+          "info",
+          `rescheduleConsultation: Created chat message about reschedule messageId ${msg.id}`,
+          null,
+          "server-action",
+          user?.id,
+        );
       } catch (error) {
-        sails.config.customLogger.log('error', 'rescheduleConsultation: Error creating chat message', {
-          error: error?.message || error
-        }, 'server-action', user?.id);
+        sails.config.customLogger.log(
+          "error",
+          "rescheduleConsultation: Error creating chat message",
+          {
+            error: error?.message || error,
+          },
+          "server-action",
+          user?.id,
+        );
       }
 
-      const updatedConsultation = await Consultation.findOne({ id: consultationId });
+      const updatedConsultation = await Consultation.findOne({
+        id: consultationId,
+      });
 
       const inviteUrl = invite.inviteToken
         ? `${process.env.PUBLIC_URL}/inv/?invite=${invite.inviteToken}`
         : null;
 
-      sails.config.customLogger.log('info', `rescheduleConsultation: Successfully rescheduled consultation ${consultationId} to ${formattedNewTime} ${patientTZ || 'UTC'}`, null, 'server-action', user?.id);
+      sails.config.customLogger.log(
+        "info",
+        `rescheduleConsultation: Successfully rescheduled consultation ${consultationId} to ${formattedNewTime} ${patientTZ || "UTC"}`,
+        null,
+        "server-action",
+        user?.id,
+      );
 
       return res.status(200).json({
         success: true,
         consultation: updatedConsultation,
         inviteUrl: inviteUrl,
         messageService: invite.messageService,
-        message: 'Consultation rescheduled successfully'
+        message: "Consultation rescheduled successfully",
       });
-
     } catch (error) {
-      sails.config.customLogger.log('error', 'rescheduleConsultation: Error rescheduling consultation', {
-        error: error?.message || error,
-        consultationId: consultationId
-      }, 'server-action', req.user?.id);
-      return res.status(500).json({ error: 'An error occurred', details: error.message });
+      sails.config.customLogger.log(
+        "error",
+        "rescheduleConsultation: Error rescheduling consultation",
+        {
+          error: error?.message || error,
+          consultationId: consultationId,
+        },
+        "server-action",
+        req.user?.id,
+      );
+      return res
+        .status(500)
+        .json({ error: "An error occurred", details: error.message });
     }
   },
 
@@ -1344,58 +2157,134 @@ module.exports = {
     try {
       const { user } = req;
       const mediasoupServers = await sails.helpers.getMediasoupServers();
-      sails.config.customLogger.log('verbose', `Retrieved mediasoup servers serverCount is ${mediasoupServers.length}`, null, 'server-action', user?.id);
+      sails.config.customLogger.log(
+        "verbose",
+        `Retrieved mediasoup servers serverCount is ${mediasoupServers.length}`,
+        null,
+        "server-action",
+        user?.id,
+      );
 
+      if (!mediasoupServers || !mediasoupServers.length) {
+        throw noMediasoupServerError();
+      }
       const serverIndex = Math.floor(Math.random() * mediasoupServers.length);
       const mediasoupServer = mediasoupServers[serverIndex];
-      sails.config.customLogger.log('info', 'Selected mediasoup server', null, 'server-action', user?.id);
+      sails.config.customLogger.log(
+        "info",
+        "Selected mediasoup server",
+        null,
+        "server-action",
+        user?.id,
+      );
 
-      const roomIdPeerId = 'test_' + uuid.v4();
-      sails.config.customLogger.log('info', `Generated roomIdPeerId ${roomIdPeerId}`, null, 'server-action', user?.id);
+      const roomIdPeerId = "test_" + uuid.v4();
+      sails.config.customLogger.log(
+        "info",
+        `Generated roomIdPeerId ${roomIdPeerId}`,
+        null,
+        "server-action",
+        user?.id,
+      );
 
       const token = await sails.helpers.getMediasoupToken.with({
         roomId: roomIdPeerId,
         peerId: roomIdPeerId,
         server: mediasoupServer,
       });
-      sails.config.customLogger.log('info', `Obtained mediasoup token for ${roomIdPeerId}`, null, 'server-action', user?.id);
+      sails.config.customLogger.log(
+        "info",
+        `Obtained mediasoup token for ${roomIdPeerId}`,
+        null,
+        "server-action",
+        user?.id,
+      );
 
       return res.json({ token, peerId: roomIdPeerId });
     } catch (err) {
-      sails.config.customLogger.log('error', 'Error in testCall', { error: err?.message || err }, 'server-action', req.user?.id);
-      return res.status(400).json({ error: 'An error occurred', details: err?.message }, 'server-action');
+      sails.config.customLogger.log(
+        "error",
+        "Error in testCall",
+        { error: err?.message || err },
+        "server-action",
+        req.user?.id,
+      );
+      return sendCallError(res, err, 400);
     }
   },
 
   async call(req, res) {
     try {
       const mediasoupServers = await sails.helpers.getMediasoupServers();
-      sails.config.customLogger.log('verbose', `Retrieved mediasoup servers count is ${mediasoupServers.length}`, null, 'server-action', req.user?.id);
+      sails.config.customLogger.log(
+        "verbose",
+        `Retrieved mediasoup servers count is ${mediasoupServers.length}`,
+        null,
+        "server-action",
+        req.user?.id,
+      );
+      if (!mediasoupServers || !mediasoupServers.length) {
+        throw noMediasoupServerError();
+      }
       const serverIndex = Math.floor(Math.random() * mediasoupServers.length);
       const mediasoupServer = mediasoupServers[serverIndex];
-      sails.config.customLogger.log('info', `Selected mediasoup server ${mediasoupServer.url}`, null, 'message', req.user?.id);
+      sails.config.customLogger.log(
+        "info",
+        `Selected mediasoup server ${mediasoupServer.url}`,
+        null,
+        "message",
+        req.user?.id,
+      );
       const id = validator.escape(req.params.consultation);
       const consultation = await Consultation.findOne({ _id: id });
       if (!consultation) {
-        sails.config.customLogger.log('warn', `Consultation with id ${id} not found`, null, 'message', req.user?.id);
-        return res.notFound({ error: 'Consultation not found' });
+        sails.config.customLogger.log(
+          "warn",
+          `Consultation with id ${id} not found`,
+          null,
+          "message",
+          req.user?.id,
+        );
+        return res.notFound({ error: "Consultation not found" });
       }
-      sails.config.customLogger.log('info', `Consultation found ${consultation.id}`, null, 'message', req.user?.id);
-      const calleeId = req.user.id === consultation.owner ? consultation.acceptedBy : consultation.owner;
+      sails.config.customLogger.log(
+        "info",
+        `Consultation found ${consultation.id}`,
+        null,
+        "message",
+        req.user?.id,
+      );
+      const calleeId =
+        req.user.id === consultation.owner
+          ? consultation.acceptedBy
+          : consultation.owner;
 
       if (!calleeId) {
-        sails.config.customLogger.log('warn', `Cannot initiate call - no valid callee found for consultation ${consultation.id}. Owner: ${consultation.owner}, AcceptedBy: ${consultation.acceptedBy}`, null, 'message', req.user?.id);
+        sails.config.customLogger.log(
+          "warn",
+          `Cannot initiate call - no valid callee found for consultation ${consultation.id}. Owner: ${consultation.owner}, AcceptedBy: ${consultation.acceptedBy}`,
+          null,
+          "message",
+          req.user?.id,
+        );
         return res.status(400).json({
-          error: 'NO_CALLEE',
-          message: sails._t('en', 'cannot initiate call patient not joined')
+          error: "NO_CALLEE",
+          message: sails._t("en", "cannot initiate call patient not joined"),
         });
       }
 
       if (req.user.id === calleeId) {
-        sails.config.customLogger.log('warn', `User ${req.user.id} attempting to call themselves in consultation ${consultation.id}`, null, 'message', req.user?.id);
+        sails.config.customLogger.log(
+          "warn",
+          `User ${req.user.id} attempting to call themselves in consultation ${consultation.id}`,
+          null,
+          "message",
+          req.user?.id,
+        );
         return res.status(400).json({
-          error: 'SELF_CALL_NOT_ALLOWED',
-          message: 'You cannot call yourself. The same user is assigned as both doctor and requester in this consultation.'
+          error: "SELF_CALL_NOT_ALLOWED",
+          message:
+            "You cannot call yourself. The same user is assigned as both doctor and requester in this consultation.",
         });
       }
 
@@ -1404,83 +2293,176 @@ module.exports = {
         peerId: req.user.id,
         server: mediasoupServer,
       });
-      sails.config.customLogger.log('info', `Caller token generated consultationId ${consultation.id}, callerId ${req.user.id}`, null, 'server-action', req.user?.id);
+      sails.config.customLogger.log(
+        "info",
+        `Caller token generated consultationId ${consultation.id}, callerId ${req.user.id}`,
+        null,
+        "server-action",
+        req.user?.id,
+      );
       const patientToken = await sails.helpers.getMediasoupToken.with({
         roomId: consultation.id,
         peerId: calleeId,
         server: mediasoupServer,
       });
-      sails.config.customLogger.log('info', `Patient token generated consultationId ${consultation.id} callerId ${calleeId}`, null, 'server-action', req.user?.id);
+      sails.config.customLogger.log(
+        "info",
+        `Patient token generated consultationId ${consultation.id} callerId ${calleeId}`,
+        null,
+        "server-action",
+        req.user?.id,
+      );
       const user = await User.findOne({ id: req.user.id });
-      sails.config.customLogger.log('info', `Callee id determined ${calleeId}`, null, 'message', req.user?.id);
+      sails.config.customLogger.log(
+        "info",
+        `Callee id determined ${calleeId}`,
+        null,
+        "message",
+        req.user?.id,
+      );
       if (!consultation.firstCallAt) {
-        await Consultation.updateOne({ id: consultation.id }).set({ firstCallAt: new Date() });
-        sails.config.customLogger.log('info', `Set firstCallAt for consultation ${consultation.id}`, null, 'server-action', req.user?.id);
+        await Consultation.updateOne({ id: consultation.id }).set({
+          firstCallAt: new Date(),
+        });
+        sails.config.customLogger.log(
+          "info",
+          `Set firstCallAt for consultation ${consultation.id}`,
+          null,
+          "server-action",
+          req.user?.id,
+        );
       }
-      const callType = req.query.audioOnly === 'true' ? 'audioCall' : 'videoCall';
+      const callType =
+        req.query.audioOnly === "true" ? "audioCall" : "videoCall";
       const msg = await Message.create({
         type: callType,
         consultation: req.params.consultation,
         from: req.user.id,
         to: calleeId,
         participants: [req.user.id],
-        isConferenceCall: !!(consultation.translator || consultation.guest || (consultation.experts && consultation.experts.length)),
-        status: 'ringing',
+        isConferenceCall: !!(
+          consultation.translator ||
+          consultation.guest ||
+          (consultation.experts && consultation.experts.length)
+        ),
+        status: "ringing",
         mediasoupURL: mediasoupServer.url,
       }).fetch();
-      sails.config.customLogger.log('info', `Call message created msgId ${msg.id} consultationId ${consultation.id}`, null, 'server-action', req.user?.id);
-      await Message.addToCollection(msg.id, 'participants', req.user.id);
-      await Message.addToCollection(msg.id, 'currentParticipants', req.user.id);
+      sails.config.customLogger.log(
+        "info",
+        `Call message created msgId ${msg.id} consultationId ${consultation.id}`,
+        null,
+        "server-action",
+        req.user?.id,
+      );
+      await Message.addToCollection(msg.id, "participants", req.user.id);
+      await Message.addToCollection(msg.id, "currentParticipants", req.user.id);
       const patientMsg = { ...msg, token: patientToken };
-      const publicInvite = await PublicInvite.findOne({ inviteToken: consultation.invitationToken });
+      const publicInvite = await PublicInvite.findOne({
+        inviteToken: consultation.invitationToken,
+      });
       const toUser = await User.findOne({ id: calleeId });
-      if (publicInvite && !consultation.flagPatientOnline && !consultation.flagPatientNotified) {
-        await PublicInvite.updateOne({ inviteToken: consultation.invitationToken }).set({ status: 'SENT' });
+      if (
+        publicInvite &&
+        !consultation.flagPatientOnline &&
+        !consultation.flagPatientNotified
+      ) {
+        await PublicInvite.updateOne({
+          inviteToken: consultation.invitationToken,
+        }).set({ status: "SENT" });
         const url = `${process.env.PUBLIC_URL}/inv/?invite=${publicInvite.inviteToken}`;
-        const locale = publicInvite.patientLanguage || sails.config.globals.DEFAULT_PATIENT_LOCALE;
-        if (toUser && toUser.email && toUser.role === sails.config.globals.ROLE_NURSE) {
+        const locale =
+          publicInvite.patientLanguage ||
+          sails.config.globals.DEFAULT_PATIENT_LOCALE;
+        if (
+          toUser &&
+          toUser.email &&
+          toUser.role === sails.config.globals.ROLE_NURSE
+        ) {
           await sails.helpers.email.with({
             to: toUser.email,
-            subject: sails._t(locale, 'notification for offline action subject', { branding: process.env.BRANDING }),
-            text: sails._t(locale, 'notification for offline action text for nurse'),
+            subject: sails._t(
+              locale,
+              "notification for offline action subject",
+              { branding: process.env.BRANDING },
+            ),
+            text: sails._t(
+              locale,
+              "notification for offline action text for nurse",
+            ),
           });
-          await Consultation.updateOne({ id: consultation.id }).set({ flagPatientNotified: true });
+          await Consultation.updateOne({ id: consultation.id }).set({
+            flagPatientNotified: true,
+          });
         } else if (publicInvite.email) {
           await sails.helpers.email.with({
             to: publicInvite.emailAddress,
-            subject: sails._t(locale, 'notification for offline action subject', { branding: process.env.BRANDING }),
-            text: sails._t(locale, 'notification for offline action text', { url }),
+            subject: sails._t(
+              locale,
+              "notification for offline action subject",
+              { branding: process.env.BRANDING },
+            ),
+            text: sails._t(locale, "notification for offline action text", {
+              url,
+            }),
           });
-          await Consultation.updateOne({ id: consultation.id }).set({ flagPatientNotified: true });
+          await Consultation.updateOne({ id: consultation.id }).set({
+            flagPatientNotified: true,
+          });
         }
-        if (toUser && toUser.phoneNumber && toUser.role === sails.config.globals.ROLE_NURSE) {
+        if (
+          toUser &&
+          toUser.phoneNumber &&
+          toUser.role === sails.config.globals.ROLE_NURSE
+        ) {
           await sails.helpers.sms.with({
             phoneNumber: toUser.phoneNumber,
-            message: sails._t(locale, 'notification for offline action text for nurse'),
+            message: sails._t(
+              locale,
+              "notification for offline action text for nurse",
+            ),
             senderEmail: publicInvite?.doctor?.email,
           });
-          await Consultation.updateOne({ id: consultation.id }).set({ flagPatientNotified: true });
+          await Consultation.updateOne({ id: consultation.id }).set({
+            flagPatientNotified: true,
+          });
         } else if (publicInvite.phoneNumber) {
           await sails.helpers.sms.with({
             phoneNumber: publicInvite.phoneNumber,
-            message: sails._t(locale, 'notification for offline action text', { url }),
+            message: sails._t(locale, "notification for offline action text", {
+              url,
+            }),
             senderEmail: publicInvite?.doctor?.email,
           });
-          await Consultation.updateOne({ id: consultation.id }).set({ flagPatientNotified: true });
+          await Consultation.updateOne({ id: consultation.id }).set({
+            flagPatientNotified: true,
+          });
         }
-        sails.config.customLogger.log('info', `Offline notification sent to patient for consultation ${consultation.id}`, null, 'server-action', req.user?.id);
+        sails.config.customLogger.log(
+          "info",
+          `Offline notification sent to patient for consultation ${consultation.id}`,
+          null,
+          "server-action",
+          req.user?.id,
+        );
       }
       const hideCallerName = sails.config.globals.hideCallerName;
-      sails.config.customLogger.log('info', `Broadcasting new call to caller ${calleeId}`, null, 'server-action', req.user?.id);
-      sails.sockets.broadcast(calleeId, 'newCall', {
+      sails.config.customLogger.log(
+        "info",
+        `Broadcasting new call to caller ${calleeId}`,
+        null,
+        "server-action",
+        req.user?.id,
+      );
+      sails.sockets.broadcast(calleeId, "newCall", {
         data: {
           consultation: req.params.consultation,
           token: patientToken,
           id: req.params.consultation,
           user: hideCallerName
-            ? { firstName: 'Anonymous', lastName: '' }
+            ? { firstName: "Anonymous", lastName: "" }
             : { firstName: user.firstName, lastName: user.lastName },
-          audioOnly: req.query.audioOnly === 'true',
+          audioOnly: req.query.audioOnly === "true",
           msg: patientMsg,
         },
       });
@@ -1491,13 +2473,19 @@ module.exports = {
           server: mediasoupServer,
         });
         const translatorMsg = { ...msg, token: translatorToken };
-        sails.config.customLogger.log('info', `Broadcasting new call to translator ${consultation.translator}`, null, 'server-action', req.user?.id);
-        sails.sockets.broadcast(consultation.translator, 'newCall', {
+        sails.config.customLogger.log(
+          "info",
+          `Broadcasting new call to translator ${consultation.translator}`,
+          null,
+          "server-action",
+          req.user?.id,
+        );
+        sails.sockets.broadcast(consultation.translator, "newCall", {
           data: {
             consultation: req.params.consultation,
             token: translatorToken,
             id: req.params.consultation,
-            audioOnly: req.query.audioOnly === 'true',
+            audioOnly: req.query.audioOnly === "true",
             msg: translatorMsg,
           },
         });
@@ -1510,13 +2498,19 @@ module.exports = {
             server: mediasoupServer,
           });
           const expertMsg = { ...msg, token: expertToken };
-          sails.config.customLogger.log('info', `Broadcasting new call to expert ${expert}`, null, 'server-action', req.user?.id);
-          sails.sockets.broadcast(expert, 'newCall', {
+          sails.config.customLogger.log(
+            "info",
+            `Broadcasting new call to expert ${expert}`,
+            null,
+            "server-action",
+            req.user?.id,
+          );
+          sails.sockets.broadcast(expert, "newCall", {
             data: {
               consultation: req.params.consultation,
               token: expertToken,
               id: req.params.consultation,
-              audioOnly: req.query.audioOnly === 'true',
+              audioOnly: req.query.audioOnly === "true",
               msg: expertMsg,
             },
           });
@@ -1529,134 +2523,257 @@ module.exports = {
           server: mediasoupServer,
         });
         const guestMsg = { ...msg, token: guestToken };
-        sails.config.customLogger.log('info', `Broadcasting new call to guest ${consultation.guest}`, null, 'server-action', req.user?.id);
-        sails.sockets.broadcast(consultation.guest, 'newCall', {
+        sails.config.customLogger.log(
+          "info",
+          `Broadcasting new call to guest ${consultation.guest}`,
+          null,
+          "server-action",
+          req.user?.id,
+        );
+        sails.sockets.broadcast(consultation.guest, "newCall", {
           data: {
             consultation: req.params.consultation,
             token: guestToken,
             id: req.params.consultation,
-            audioOnly: req.query.audioOnly === 'true',
+            audioOnly: req.query.audioOnly === "true",
             msg: guestMsg,
           },
         });
       }
       msg.token = callerToken;
-      sails.config.customLogger.log('info', `Call setup completed consultationId ${consultation.id} callerId ${req.user.id}`, null, 'message', req.user?.id);
+      sails.config.customLogger.log(
+        "info",
+        `Call setup completed consultationId ${consultation.id} callerId ${req.user.id}`,
+        null,
+        "message",
+        req.user?.id,
+      );
       return res.json({
         token: callerToken,
         id: validator.escape(req.params.consultation),
         msg,
       });
     } catch (error) {
-      sails.config.customLogger.log('error', 'Error in call endpoint', { error: error?.message || error }, 'server-action', req.user?.id);
-      return res.status(400).json({ error: 'An error occurred', details: error?.message });
+      sails.config.customLogger.log(
+        "error",
+        "Error in call endpoint",
+        { error: error?.message || error },
+        "server-action",
+        req.user?.id,
+      );
+      return sendCallError(res, error, 400);
     }
   },
 
   async rejectCall(req, res) {
     try {
-      const consultation = await Consultation.findOne({ _id: req.params.consultation });
-      const message = await Message.findOne({ id: req.params.message }).populate('currentParticipants');
+      const consultation = await Consultation.findOne({
+        _id: req.params.consultation,
+      });
+      const message = await Message.findOne({
+        id: req.params.message,
+      }).populate("currentParticipants");
       if (message.isConferenceCall || consultation.experts?.length) {
-        if (!message.currentParticipants.length || message.status === 'ended') {
-          sails.config.customLogger.log('info', `No active conference participants or call already ended messageId ${message.id}`, null, 'message', req.user?.id);
+        if (!message.currentParticipants.length || message.status === "ended") {
+          sails.config.customLogger.log(
+            "info",
+            `No active conference participants or call already ended messageId ${message.id}`,
+            null,
+            "message",
+            req.user?.id,
+          );
           return res.json({ status: 200 });
         }
-        await Message.removeFromCollection(message.id, 'currentParticipants', req.user.id);
-        const isParticipant = message.currentParticipants.find(p => p.id === req.user.id);
-        if (req.user.role === 'doctor' && isParticipant) {
-          await Message.endCall(message, consultation, 'DOCTOR_LEFT');
-          sails.config.customLogger.log('info', `Call ended due to doctor leaving messageId ${message.id} doctorId ${req.user.id}`, null, 'server-action', req.user?.id);
+        await Message.removeFromCollection(
+          message.id,
+          "currentParticipants",
+          req.user.id,
+        );
+        const isParticipant = message.currentParticipants.find(
+          (p) => p.id === req.user.id,
+        );
+        if (req.user.role === "doctor" && isParticipant) {
+          await Message.endCall(message, consultation, "DOCTOR_LEFT");
+          sails.config.customLogger.log(
+            "info",
+            `Call ended due to doctor leaving messageId ${message.id} doctorId ${req.user.id}`,
+            null,
+            "server-action",
+            req.user?.id,
+          );
         } else if (message.currentParticipants.length <= 2 && isParticipant) {
-          await Message.endCall(message, consultation, 'MEMBERS_LEFT');
-          sails.config.customLogger.log('info', `Call ended due to members leaving messageId ${message.id}`, null, 'server-action', req.user?.id);
+          await Message.endCall(message, consultation, "MEMBERS_LEFT");
+          sails.config.customLogger.log(
+            "info",
+            `Call ended due to members leaving messageId ${message.id}`,
+            null,
+            "server-action",
+            req.user?.id,
+          );
         }
         return res.json({ status: 200 });
       }
       await Message.updateOne({
         id: req.params.message,
-        consultation: req.params.consultation
+        consultation: req.params.consultation,
       }).set({ closedAt: new Date() });
-      await Message.endCall(message, consultation, 'MEMBERS_LEFT');
-      const decryptedConsultation = Consultation.decryptForBroadcast(consultation);
-      sails.sockets.broadcast(consultation.acceptedBy, 'rejectCall', { data: { consultation: decryptedConsultation, message } });
-      sails.sockets.broadcast(consultation.owner, 'rejectCall', { data: { consultation: decryptedConsultation, message } });
-      sails.config.customLogger.log('info', `Call rejection broadcast consultationId ${consultation.id} messageId ${message.id}`, null, 'server-action', req.user?.id);
+      await Message.endCall(message, consultation, "MEMBERS_LEFT");
+      const decryptedConsultation =
+        Consultation.decryptForBroadcast(consultation);
+      sails.sockets.broadcast(consultation.acceptedBy, "rejectCall", {
+        data: { consultation: decryptedConsultation, message },
+      });
+      sails.sockets.broadcast(consultation.owner, "rejectCall", {
+        data: { consultation: decryptedConsultation, message },
+      });
+      sails.config.customLogger.log(
+        "info",
+        `Call rejection broadcast consultationId ${consultation.id} messageId ${message.id}`,
+        null,
+        "server-action",
+        req.user?.id,
+      );
       return res.json({ status: 200 });
     } catch (error) {
-      sails.config.customLogger.log('error', 'Error in rejectCall', { error: error?.message || error }, 'server-action', req.user?.id);
+      sails.config.customLogger.log(
+        "error",
+        "Error in rejectCall",
+        { error: error?.message || error },
+        "server-action",
+        req.user?.id,
+      );
       return res.json(error);
     }
   },
 
   async acceptCall(req, res) {
     try {
-      const consultation = await Consultation.findOne({ _id: req.params.consultation });
+      const consultation = await Consultation.findOne({
+        _id: req.params.consultation,
+      });
       const message = await Message.findOne({ id: req.params.message })
-        .populate('currentParticipants')
-        .populate('participants');
-      if (!message.participants.find(p => p.id === req.user.id)) {
-        await Message.addToCollection(req.params.message, 'participants', req.user.id);
+        .populate("currentParticipants")
+        .populate("participants");
+      if (!message.participants.find((p) => p.id === req.user.id)) {
+        await Message.addToCollection(
+          req.params.message,
+          "participants",
+          req.user.id,
+        );
       }
       if (message.isConferenceCall) {
-        await Message.addToCollection(req.params.message, 'currentParticipants', req.user.id);
+        await Message.addToCollection(
+          req.params.message,
+          "currentParticipants",
+          req.user.id,
+        );
         if (!message.acceptedAt) {
-          await Message.updateOne({ _id: req.params.message, consultation: req.params.consultation }).set({
+          await Message.updateOne({
+            _id: req.params.message,
+            consultation: req.params.consultation,
+          }).set({
             acceptedAt: new Date(),
-            status: 'ongoing',
+            status: "ongoing",
           });
         }
-        sails.config.customLogger.log('info', `Conference call accepted messageId ${req.params.message} userId ${req.user.id}`, null, 'user-action', req.user?.id);
+        sails.config.customLogger.log(
+          "info",
+          `Conference call accepted messageId ${req.params.message} userId ${req.user.id}`,
+          null,
+          "user-action",
+          req.user?.id,
+        );
         return res.json({ status: 200 });
       }
-      await Message.updateOne({ _id: req.params.message, consultation: req.params.consultation }).set({
+      await Message.updateOne({
+        _id: req.params.message,
+        consultation: req.params.consultation,
+      }).set({
         acceptedAt: new Date(),
-        status: 'ongoing',
+        status: "ongoing",
       });
-      const decryptedConsultation = Consultation.decryptForBroadcast(consultation);
-      sails.sockets.broadcast(consultation.acceptedBy, 'acceptCall', {
+      const decryptedConsultation =
+        Consultation.decryptForBroadcast(consultation);
+      sails.sockets.broadcast(consultation.acceptedBy, "acceptCall", {
         data: { consultation: decryptedConsultation, message },
       });
-      sails.sockets.broadcast(consultation.owner, 'acceptCall', {
+      sails.sockets.broadcast(consultation.owner, "acceptCall", {
         data: { consultation: decryptedConsultation, message },
       });
-      sails.config.customLogger.log('info', `Call accepted broadcast for consultationId ${consultation.id} messageId ${message.id}`, null, 'server-action', req.user?.id);
+      sails.config.customLogger.log(
+        "info",
+        `Call accepted broadcast for consultationId ${consultation.id} messageId ${message.id}`,
+        null,
+        "server-action",
+        req.user?.id,
+      );
       return res.json({ status: 200 });
     } catch (error) {
-      sails.config.customLogger.log('error', 'Error in acceptCall', { error: error?.message || error }, 'server-action', req.user?.id);
+      sails.config.customLogger.log(
+        "error",
+        "Error in acceptCall",
+        { error: error?.message || error },
+        "server-action",
+        req.user?.id,
+      );
       return res.json(error);
     }
   },
 
   uploadFile(req, res) {
     const fileId = uuid.v4();
-    const locale = validator.escape(req.headers?.locale || 'en').trim();
-    const sanitizedLocale = locale || 'en';
-    const maxUploadSizeMb = parseInt(process.env.MAX_UPLOAD_SIZE_MB || '10', 10);
+    const locale = validator.escape(req.headers?.locale || "en").trim();
+    const sanitizedLocale = locale || "en";
+    const maxUploadSizeMb = parseInt(
+      process.env.MAX_UPLOAD_SIZE_MB || "10",
+      10,
+    );
     const maxBytes = maxUploadSizeMb * 1024 * 1024;
 
-    req.file('attachment').upload(
+    req.file("attachment").upload(
       {
         dirname: sails.config.globals.attachmentsDir,
         maxBytes,
-        saveAs: function(__newFileStream, cb) {
-          const fileExtension = __newFileStream.filename.split('.').pop();
+        saveAs: function (__newFileStream, cb) {
+          const fileExtension = __newFileStream.filename.split(".").pop();
           const filePath = `${req.params.consultation}_${fileId}.${fileExtension}`;
           cb(null, filePath);
         },
       },
       async function whenDone(err, uploadedFiles) {
         if (err) {
-          if (err.code === 'E_EXCEEDS_UPLOAD_LIMIT') {
-            sails.config.customLogger.log('error', 'Upload error: exceeds upload limit', null, 'message', req.user?.id);
-            return res.status(413).send(sails._t(sanitizedLocale, 'max file size'));
+          if (err.code === "E_EXCEEDS_UPLOAD_LIMIT") {
+            sails.config.customLogger.log(
+              "error",
+              "Upload error: exceeds upload limit",
+              null,
+              "message",
+              req.user?.id,
+            );
+            return res
+              .status(413)
+              .send(sails._t(sanitizedLocale, "max file size"));
           }
-          sails.config.customLogger.log('error', 'Upload error', { error: err?.message || err }, 'message', req.user?.id);
-          return res.status(500).send(sails._t(sanitizedLocale, 'server error'));
+          sails.config.customLogger.log(
+            "error",
+            "Upload error",
+            { error: err?.message || err },
+            "message",
+            req.user?.id,
+          );
+          return res
+            .status(500)
+            .send(sails._t(sanitizedLocale, "server error"));
         }
         if (!uploadedFiles.length) {
-          sails.config.customLogger.log('info', 'No file uploaded', null, 'message', req.user?.id);
-          return res.status(400).send(sails._t(sanitizedLocale, 'no file'));
+          sails.config.customLogger.log(
+            "info",
+            "No file uploaded",
+            null,
+            "message",
+            req.user?.id,
+          );
+          return res.status(400).send(sails._t(sanitizedLocale, "no file"));
         }
 
         const uploadedFile = uploadedFiles[0];
@@ -1664,40 +2781,70 @@ module.exports = {
         try {
           buffer = fs.readFileSync(uploadedFile.fd);
         } catch (readError) {
-          sails.config.customLogger.log('error', 'Error reading uploaded file', { error: readError?.message || readError }, 'message', req.user?.id);
-          return res.status(500).send(sails._t(sanitizedLocale, 'server error'));
+          sails.config.customLogger.log(
+            "error",
+            "Error reading uploaded file",
+            { error: readError?.message || readError },
+            "message",
+            req.user?.id,
+          );
+          return res
+            .status(500)
+            .send(sails._t(sanitizedLocale, "server error"));
         }
-        const { fileTypeFromBuffer } = await import('file-type');
+        const { fileTypeFromBuffer } = await import("file-type");
         const type = await fileTypeFromBuffer(buffer);
         const extraMimeTypes = sails.config.globals.EXTRA_MIME_TYPES;
         const defaultMimeTypes = sails.config.globals.DEFAULT_MIME_TYPES;
-        const allowedMimeTypes = extraMimeTypes && extraMimeTypes.length > 0
-          ? extraMimeTypes
-          : defaultMimeTypes;
+        const allowedMimeTypes =
+          extraMimeTypes && extraMimeTypes.length > 0
+            ? extraMimeTypes
+            : defaultMimeTypes;
 
         if (!allowedMimeTypes.includes(type?.mime)) {
-          sails.config.customLogger.log('error', `Invalid file type mime ${type?.mime}`, null, 'message', req.user?.id);
+          sails.config.customLogger.log(
+            "error",
+            `Invalid file type mime ${type?.mime}`,
+            null,
+            "message",
+            req.user?.id,
+          );
           fs.unlinkSync(uploadedFile.fd);
-          return res.status(400).send(sails._t(locale, 'invalid file type'));
+          return res.status(400).send(sails._t(locale, "invalid file type"));
         }
 
-        const filePath = `${req.params.consultation}_${fileId}.${uploadedFile.filename.split('.').pop()}`;
+        const filePath = `${req.params.consultation}_${fileId}.${uploadedFile.filename.split(".").pop()}`;
 
         try {
-          if (process.env.NODE_ENV !== 'development') {
+          if (process.env.NODE_ENV !== "development") {
             try {
-              const { isInfected } = await sails.config.globals.clamscan.isInfected(uploadedFile.fd);
+              const { isInfected } =
+                await sails.config.globals.clamscan.isInfected(uploadedFile.fd);
               if (isInfected) {
-                sails.config.customLogger.log('error', `File is infected fileName ${uploadedFile?.filename}`, null, 'message', req.user?.id);
+                sails.config.customLogger.log(
+                  "error",
+                  `File is infected fileName ${uploadedFile?.filename}`,
+                  null,
+                  "message",
+                  req.user?.id,
+                );
                 fs.unlinkSync(uploadedFile.fd);
-                return res.status(400).send(new Error(sails._t(locale, 'infected file')));
+                return res
+                  .status(400)
+                  .send(new Error(sails._t(locale, "infected file")));
               }
             } catch (clamscanError) {
-              sails.config.customLogger.log('error', 'Error during file virus scan', { error: clamscanError?.message || clamscanError }, 'server-action', req.user?.id);
+              sails.config.customLogger.log(
+                "error",
+                "Error during file virus scan",
+                { error: clamscanError?.message || clamscanError },
+                "server-action",
+                req.user?.id,
+              );
               if (uploadedFile.id) {
                 fs.unlinkSync(uploadedFile.fd);
               }
-              return res.status(500).send(sails._t(locale, 'virus scan'));
+              return res.status(500).send(sails._t(locale, "virus scan"));
             }
           }
 
@@ -1708,16 +2855,30 @@ module.exports = {
               const encryptedBuffer = encryption.encryptBuffer(buffer);
               fs.writeFileSync(uploadedFile.fd, encryptedBuffer);
               isEncrypted = true;
-              sails.config.customLogger.log('info', `File encrypted successfully: ${filePath}`, null, 'server-action', req.user?.id);
+              sails.config.customLogger.log(
+                "info",
+                `File encrypted successfully: ${filePath}`,
+                null,
+                "server-action",
+                req.user?.id,
+              );
             } catch (encryptionError) {
-              sails.config.customLogger.log('error', 'Error encrypting file', { error: encryptionError?.message || encryptionError }, 'server-action', req.user?.id);
+              sails.config.customLogger.log(
+                "error",
+                "Error encrypting file",
+                { error: encryptionError?.message || encryptionError },
+                "server-action",
+                req.user?.id,
+              );
               fs.unlinkSync(uploadedFile.fd);
-              return res.status(500).send(sails._t(sanitizedLocale, 'server error'));
+              return res
+                .status(500)
+                .send(sails._t(sanitizedLocale, "server error"));
             }
           }
 
           const message = await Message.create({
-            type: 'attachment',
+            type: "attachment",
             mimeType: uploadedFile.type,
             fileName: uploadedFile.filename,
             filePath,
@@ -1727,18 +2888,36 @@ module.exports = {
             from: req.user.id,
           }).fetch();
 
-          sails.config.customLogger.log('info', `File uploaded and message created successfully messageId ${message.id}`, null, 'server-action', req.user?.id);
+          sails.config.customLogger.log(
+            "info",
+            `File uploaded and message created successfully messageId ${message.id}`,
+            null,
+            "server-action",
+            req.user?.id,
+          );
           return res.ok({ message });
         } catch (error) {
-          sails.config.customLogger.log('error', 'Error processing file upload', { error: error?.message || error }, 'message', req.user?.id);
+          sails.config.customLogger.log(
+            "error",
+            "Error processing file upload",
+            { error: error?.message || error },
+            "message",
+            req.user?.id,
+          );
           try {
             fs.unlinkSync(uploadedFile.fd);
           } catch (deleteError) {
-            sails.config.customLogger.log('error', 'Error deleting file', { error: deleteError?.message || deleteError }, 'message', req.user?.id);
+            sails.config.customLogger.log(
+              "error",
+              "Error deleting file",
+              { error: deleteError?.message || deleteError },
+              "message",
+              req.user?.id,
+            );
           }
           return res.serverError();
         }
-      }
+      },
     );
   },
 
@@ -1747,17 +2926,30 @@ module.exports = {
     const msg = await Message.findOne({ id: attachment });
 
     if (!msg || !msg.filePath) {
-      return res.notFound({ message: 'File not found' });
+      return res.notFound({ message: "File not found" });
     }
 
-    if (!msg.mimeType.startsWith('audio')) {
-      const safeFileName = msg.fileName.replace(/[^a-zA-Z0-9-_.]/g, '_');
-      res.setHeader('Content-disposition', `attachment; filename=${safeFileName}`);
+    if (!msg.mimeType.startsWith("audio")) {
+      const safeFileName = msg.fileName.replace(/[^a-zA-Z0-9-_.]/g, "_");
+      res.setHeader(
+        "Content-disposition",
+        `attachment; filename=${safeFileName}`,
+      );
     }
 
-    if (!msg.filePath || msg.filePath.includes('..') || path.isAbsolute(msg.filePath)) {
-      sails.config.customLogger.log('warn', `Unsafe file path: ${msg.filePath}`, null, 'message', req.user?.id);
-      return res.forbidden({ message: 'Invalid file path' });
+    if (
+      !msg.filePath ||
+      msg.filePath.includes("..") ||
+      path.isAbsolute(msg.filePath)
+    ) {
+      sails.config.customLogger.log(
+        "warn",
+        `Unsafe file path: ${msg.filePath}`,
+        null,
+        "message",
+        req.user?.id,
+      );
+      return res.forbidden({ message: "Invalid file path" });
     }
 
     const fileName = path.basename(msg.filePath);
@@ -1765,39 +2957,74 @@ module.exports = {
     const resolvedPath = path.join(baseDir, fileName);
 
     if (!resolvedPath.startsWith(baseDir)) {
-      sails.config.customLogger.log('warn', `Path traversal attempt blocked: ${resolvedPath}`, null, 'message', req.user?.id);
-      return res.forbidden({ message: 'Invalid file path' });
+      sails.config.customLogger.log(
+        "warn",
+        `Path traversal attempt blocked: ${resolvedPath}`,
+        null,
+        "message",
+        req.user?.id,
+      );
+      return res.forbidden({ message: "Invalid file path" });
     }
 
     if (!fs.existsSync(resolvedPath)) {
-      sails.config.customLogger.log('warn', `File not found in ${resolvedPath}`, null, 'message', req.user?.id);
+      sails.config.customLogger.log(
+        "warn",
+        `File not found in ${resolvedPath}`,
+        null,
+        "message",
+        req.user?.id,
+      );
       return res.notFound();
     }
 
     const filePath = resolvedPath;
     if (!fs.existsSync(filePath)) {
-      sails.config.customLogger.log('warn', `File not found in ${filePath}`, null, 'message', req.user?.id);
+      sails.config.customLogger.log(
+        "warn",
+        `File not found in ${filePath}`,
+        null,
+        "message",
+        req.user?.id,
+      );
       return res.notFound();
     }
 
     const encryption = sails.helpers.encryption();
-    const shouldDecrypt = msg.isEncrypted || (sails.config.globals.ENCRYPTION_ENABLED && encryption.isFileEncrypted(filePath));
+    const shouldDecrypt =
+      msg.isEncrypted ||
+      (sails.config.globals.ENCRYPTION_ENABLED &&
+        encryption.isFileEncrypted(filePath));
 
     if (shouldDecrypt) {
       try {
         const decryptedBuffer = encryption.decryptFile(filePath);
-        res.setHeader('Content-Type', msg.mimeType);
-        res.setHeader('Content-Length', decryptedBuffer.length);
+        res.setHeader("Content-Type", msg.mimeType);
+        res.setHeader("Content-Length", decryptedBuffer.length);
         return res.send(decryptedBuffer);
       } catch (decryptError) {
-        sails.config.customLogger.log('error', 'Error decrypting file', { error: decryptError?.message || decryptError }, 'server-action', req.user?.id);
-        return res.serverError({ error: 'Failed to decrypt file. The encryption key may be invalid.' });
+        sails.config.customLogger.log(
+          "error",
+          "Error decrypting file",
+          { error: decryptError?.message || decryptError },
+          "server-action",
+          req.user?.id,
+        );
+        return res.serverError({
+          error: "Failed to decrypt file. The encryption key may be invalid.",
+        });
       }
     } else {
-      res.setHeader('Content-Type', msg.mimeType);
+      res.setHeader("Content-Type", msg.mimeType);
       const readStream = fs.createReadStream(filePath);
-      readStream.on('error', (err) => {
-        sails.config.customLogger.log('error', 'Error reading file', { error: err?.message || err }, 'server-action', req.user?.id);
+      readStream.on("error", (err) => {
+        sails.config.customLogger.log(
+          "error",
+          "Error reading file",
+          { error: err?.message || err },
+          "server-action",
+          req.user?.id,
+        );
         if (!res.headersSent) {
           return res.serverError();
         }
@@ -1809,17 +3036,31 @@ module.exports = {
   async patientFeedback(req, res) {
     try {
       await Consultation.updateOne({ id: req.body.consultationId }).set({
-        patientRating: req.body.rating || '',
+        patientRating: req.body.rating || "",
         patientComment: req.body.comment,
       });
-      await AnonymousConsultation.updateOne({ consultationId: req.body.consultationId }).set({
-        patientRating: req.body.rating || '',
+      await AnonymousConsultation.updateOne({
+        consultationId: req.body.consultationId,
+      }).set({
+        patientRating: req.body.rating || "",
         patientComment: req.body.comment,
       });
-      sails.config.customLogger.log('info', `Patient feedback updated for consultationId ${req.body.consultationId}`, null, 'server-action', req.user?.id);
+      sails.config.customLogger.log(
+        "info",
+        `Patient feedback updated for consultationId ${req.body.consultationId}`,
+        null,
+        "server-action",
+        req.user?.id,
+      );
       return res.json({ status: 200 });
     } catch (error) {
-      sails.config.customLogger.log('error', 'Error updating patient feedback', { error: error?.message || error }, 'server-action', req.user?.id);
+      sails.config.customLogger.log(
+        "error",
+        "Error updating patient feedback",
+        { error: error?.message || error },
+        "server-action",
+        req.user?.id,
+      );
       return res.status(500).json(error);
     }
   },
@@ -1827,40 +3068,270 @@ module.exports = {
   async doctorFeedback(req, res) {
     try {
       await Consultation.updateOne({ id: req.body.consultationId }).set({
-        doctorRating: req.body.rating || '',
+        doctorRating: req.body.rating || "",
         doctorComment: req.body.comment,
       });
-      await AnonymousConsultation.updateOne({ consultationId: req.body.consultationId }).set({
-        doctorRating: req.body.rating || '',
+      await AnonymousConsultation.updateOne({
+        consultationId: req.body.consultationId,
+      }).set({
+        doctorRating: req.body.rating || "",
         doctorComment: req.body.comment,
       });
-      sails.config.customLogger.log('info', `Doctor feedback updated for consultationId ${req.body.consultationId}`, null, 'server-action', req.user?.id);
+      sails.config.customLogger.log(
+        "info",
+        `Doctor feedback updated for consultationId ${req.body.consultationId}`,
+        null,
+        "server-action",
+        req.user?.id,
+      );
       return res.json({ status: 200 });
     } catch (error) {
-      sails.config.customLogger.log('error', 'Error updating doctor feedback', { error: error?.message || error }, 'server-action', req.user?.id);
+      sails.config.customLogger.log(
+        "error",
+        "Error updating doctor feedback",
+        { error: error?.message || error },
+        "server-action",
+        req.user?.id,
+      );
       return res.status(500).json(error);
     }
   },
 
   async consultationsCSV(req, res) {
     try {
-      const consultations = await AnonymousConsultation.find()
-        .populate('acceptedBy')
-        .populate('queue')
-        .populate('owner');
-      sails.config.customLogger.log('info', `Fetched consultations for CSV export count ${consultations.length}`, null, 'server-action', req.user?.id);
-      const mappedConsultations = consultations.map(Consultation.getConsultationReport);
-      const fields = Consultation.columns.map(c => c.colName);
+      //  optional from/to filter (same semantics as consultationsStats)
+      const range = parseDateRange(req.query);
+      if (range.error) {
+        return res.status(400).json({ message: range.error });
+      }
+      // Same consultation set as the dashboard stats: closed consultations
+      // plus the pending / active ones, filtered on the same date fields.
+      const closed = await AnonymousConsultation.find(
+        anonymousConsultationWhere(range.from, range.to),
+      )
+        .populate("acceptedBy")
+        .populate("queue")
+        .populate("owner");
+      const live = await Consultation.find(
+        liveConsultationWhere(range.from, range.to),
+      )
+        .populate("acceptedBy")
+        .populate("queue")
+        .populate("owner")
+        .populate("invite");
+      const consultations = closed
+        .map((c) => Object.assign(c, { status: "closed" }))
+        .concat(
+          live.map((c) => ({
+            id: c.id,
+            status: c.status,
+            inviteCreatedAt: c.invite && c.invite.createdAt,
+            inviteScheduledFor: c.invite && c.invite.scheduledFor,
+            queue: c.queue,
+            consultationCreatedAt: c.createdAt,
+            acceptedBy: c.acceptedBy,
+            owner: c.owner,
+            patientRating: c.patientRating,
+            patientComment: c.patientComment,
+            doctorRating: c.doctorRating,
+            doctorComment: c.doctorComment,
+            consultationEstimatedAt: c.consultationEstimatedAt,
+            firstCallAt: c.firstCallAt,
+          })),
+        );
+      sails.config.customLogger.log(
+        "info",
+        `Fetched consultations for CSV export count ${consultations.length}`,
+        null,
+        "server-action",
+        req.user?.id,
+      );
+      const mappedConsultations = consultations.map(
+        Consultation.getConsultationReport,
+      );
+      const fields = Consultation.columns.map((c) => c.colName);
       const opts = { fields };
       const parser = new json2csv.Parser();
       const csv = parser.parse(mappedConsultations, opts);
-      sails.config.customLogger.log('info', `CSV file generated recordCount ${mappedConsultations.length}`, null, 'message', req.user?.id);
-      res.setHeader('Content-Disposition', 'attachment; filename="consultations_summary.csv"');
-      res.setHeader('Content-Type', 'text/csv');
+      sails.config.customLogger.log(
+        "info",
+        `CSV file generated recordCount ${mappedConsultations.length}`,
+        null,
+        "message",
+        req.user?.id,
+      );
+      res.setHeader(
+        "Content-Disposition",
+        'attachment; filename="consultations_summary.csv"',
+      );
+      res.setHeader("Content-Type", "text/csv");
       return res.send(csv);
     } catch (err) {
-      sails.config.customLogger.log('error', 'Error generating CSV file', { error: err?.message || err }, 'server-action', req.user?.id);
-      return res.status(500).send('Error generating CSV file');
+      sails.config.customLogger.log(
+        "error",
+        "Error generating CSV file",
+        { error: err?.message || err },
+        "server-action",
+        req.user?.id,
+      );
+      return res.status(500).send("Error generating CSV file");
+    }
+  },
+
+  /**
+   *  GET /api/v1/consultations-stats?from=&to=  (admin only)
+   * Aggregated numbers for the admin dashboard.
+   *  - closed consultations come from AnonymousConsultation (kept forever,
+   *    same source as the CSV export), filtered on consultationCreatedAt;
+   *  - pending / active consultations come from Consultation, filtered on createdAt.
+   */
+  async consultationsStats(req, res) {
+    try {
+      const range = parseDateRange(req.query);
+      if (range.error) {
+        return res.status(400).json({ message: range.error });
+      }
+      const { from, to } = range;
+
+      const closed = await AnonymousConsultation.find(
+        anonymousConsultationWhere(from, to),
+      )
+        .populate("acceptedBy")
+        .populate("queue");
+
+      const live = await Consultation.find(liveConsultationWhere(from, to));
+
+      const pendingCount = live.filter((c) => c.status === "pending").length;
+      const activeCount = live.filter((c) => c.status === "active").length;
+
+      const durations = closed.map(consultationDuration);
+      const waitingTimes = closed.map((c) =>
+        c.acceptedAt && c.consultationCreatedAt
+          ? c.acceptedAt - c.consultationCreatedAt
+          : null,
+      );
+      const callAverages = closed
+        .filter((c) => (c.successfulCallsCount || 0) > 0)
+        .map((c) =>
+          typeof c.averageCallDuration === "number"
+            ? c.averageCallDuration * 60000
+            : null,
+        );
+
+      // patient satisfaction is stored as 'good' | 'ok' | 'bad'
+      const patientRatings = { good: 0, ok: 0, bad: 0 };
+      closed.forEach((c) => {
+        if (
+          Object.prototype.hasOwnProperty.call(patientRatings, c.patientRating)
+        ) {
+          patientRatings[c.patientRating]++;
+        }
+      });
+
+      const byDoctorMap = {};
+      closed.forEach((c) => {
+        const id = c.acceptedBy && (c.acceptedBy.id || c.acceptedBy);
+        const key = id ? String(id) : "none";
+        if (!byDoctorMap[key]) {
+          byDoctorMap[key] = {
+            id: id ? String(id) : null,
+            name: personName(c.acceptedBy),
+            count: 0,
+            durations: [],
+          };
+        }
+        byDoctorMap[key].count++;
+        byDoctorMap[key].durations.push(consultationDuration(c));
+      });
+      const byDoctor = Object.values(byDoctorMap)
+        .map((d) => ({
+          id: d.id,
+          name: d.name,
+          count: d.count,
+          averageDuration: average(d.durations),
+        }))
+        .sort((a, b) => b.count - a.count);
+
+      const queueIds = _.uniq(
+        live
+          .map((c) => c.queue)
+          .filter(Boolean)
+          .map(String),
+      );
+      const queues = queueIds.length ? await Queue.find({ id: queueIds }) : [];
+      const queueNames = {};
+      queues.forEach((q) => {
+        queueNames[String(q.id)] = q.name;
+      });
+
+      const byQueueMap = {};
+      const addQueue = (id, name, field) => {
+        const key = id ? String(id) : "none";
+        if (!byQueueMap[key]) {
+          byQueueMap[key] = {
+            id: id ? String(id) : null,
+            name: name || "",
+            total: 0,
+            closed: 0,
+            pending: 0,
+            active: 0,
+          };
+        }
+        if (!byQueueMap[key].name && name) {
+          byQueueMap[key].name = name;
+        }
+        byQueueMap[key][field]++;
+        byQueueMap[key].total++;
+      };
+      closed.forEach((c) => {
+        const q = c.queue;
+        addQueue(q && (q.id || q), q && q.name, "closed");
+      });
+      live.forEach((c) => {
+        addQueue(c.queue, c.queue ? queueNames[String(c.queue)] : "", c.status);
+      });
+      const byQueue = Object.values(byQueueMap).sort(
+        (a, b) => b.total - a.total,
+      );
+
+      const sum = (field) =>
+        closed.reduce((acc, c) => acc + (Number(c[field]) || 0), 0);
+
+      const result = {
+        from,
+        to,
+        total: closed.length + pendingCount + activeCount,
+        closed: closed.length,
+        pending: pendingCount,
+        active: activeCount,
+        averageDuration: average(durations), // ms, closed consultations
+        averageWaitingTime: average(waitingTimes), // ms, patient joined -> accepted
+        averageCallDuration: average(callAverages), // ms
+        successfulCalls: sum("successfulCallsCount"),
+        missedCalls: sum("missedCallsCount"),
+        patientRatings,
+        byDoctor,
+        byQueue,
+      };
+      sails.config.customLogger.log(
+        "info",
+        `Consultation stats computed closed ${result.closed} pending ${pendingCount} active ${activeCount}`,
+        null,
+        "server-action",
+        req.user?.id,
+      );
+      return res.json(result);
+    } catch (err) {
+      sails.config.customLogger.log(
+        "error",
+        "Error computing consultation stats",
+        { error: err?.message || err },
+        "server-action",
+        req.user?.id,
+      );
+      return res
+        .status(500)
+        .json({ message: "Error computing consultation stats" });
     }
   },
 
@@ -1868,20 +3339,26 @@ module.exports = {
     try {
       const selector = {
         consultation: req.params.consultation,
-        type: { in: ['videoCall', 'audioCall'] },
-        status: { in: ['ringing', 'ongoing'] },
+        type: { in: ["videoCall", "audioCall"] },
+        status: { in: ["ringing", "ongoing"] },
       };
-      const [call] = await Message.find({ where: selector, sort: [{ createdAt: 'DESC' }] }).limit(1);
+      const [call] = await Message.find({
+        where: selector,
+        sort: [{ createdAt: "DESC" }],
+      }).limit(1);
       let mediasoupServer;
       if (call) {
-        [mediasoupServer] = await MediasoupServer.find({ url: call.mediasoupURL }).limit(1);
+        [mediasoupServer] = await MediasoupServer.find({
+          url: call.mediasoupURL,
+        }).limit(1);
         if (!mediasoupServer) {
-          if (call.mediasoupURL === process.env.MEDIASOUP_URL) {
-            mediasoupServer = {
-              url: process.env.MEDIASOUP_URL,
-              password: process.env.MEDIASOUP_SECRET,
-              username: process.env.MEDIASOUP_USER,
-            };
+          const fallbackServer = mediasoupClient.getFallbackServer();
+          if (
+            fallbackServer.url &&
+            mediasoupClient.normalizeBaseUrl(call.mediasoupURL) ===
+              fallbackServer.url
+          ) {
+            mediasoupServer = fallbackServer;
           } else {
             return res.status(500).send();
           }
@@ -1894,35 +3371,76 @@ module.exports = {
       }
       return res.status(200).json(call);
     } catch (error) {
-      return res.status(500).json({ error: 'An error occurred', details: error.message });
+      sails.config.customLogger.log(
+        "error",
+        "Error in getCurrentCall",
+        { error: error?.message || error },
+        "server-action",
+        req.user?.id,
+      );
+      return sendCallError(res, error, 500);
     }
   },
 
   async getConsultationFromToken(req, res) {
     let tokenString = req.query.token;
     if (!tokenString) {
-      sails.config.customLogger.log('warn', 'Token missing in getConsultationFromToken', null, 'message', req.user?.id);
-      return res.status(400).json({ message: 'invalidUrl' });
+      sails.config.customLogger.log(
+        "warn",
+        "Token missing in getConsultationFromToken",
+        null,
+        "message",
+        req.user?.id,
+      );
+      return res.status(400).json({ message: "invalidUrl" });
     }
     tokenString = escapeHtml(tokenString.trim());
     try {
       const token = await Token.findOne({ token: tokenString });
       if (!token) {
-        sails.config.customLogger.log('warn', `Token not found or expired ${tokenString}`, null, 'message', req.user?.id);
-        return res.status(400).json({ message: 'tokenExpired' });
+        sails.config.customLogger.log(
+          "warn",
+          `Token not found or expired ${tokenString}`,
+          null,
+          "message",
+          req.user?.id,
+        );
+        return res.status(400).json({ message: "tokenExpired" });
       }
       const consultationId = token.value;
       const consultation = await Consultation.findOne({ id: consultationId });
       if (!consultation) {
-        sails.config.customLogger.log('warn', `Consultation ${consultationId} not found for token`, null, 'message', req.user?.id);
-        return res.status(400).json({ message: 'invalidUrl' });
+        sails.config.customLogger.log(
+          "warn",
+          `Consultation ${consultationId} not found for token`,
+          null,
+          "message",
+          req.user?.id,
+        );
+        return res.status(400).json({ message: "invalidUrl" });
       }
       const queue = await Queue.findOne({ id: consultation.queue });
-      sails.config.customLogger.log('verbose', `Consultation ${consultationId} retrieved from token: queue ${queue ? queue.id : null}`, null, 'server-action', req.user?.id);
-      return res.status(200).json({ id: consultation.id, status: consultation.status, queue });
+      sails.config.customLogger.log(
+        "verbose",
+        `Consultation ${consultationId} retrieved from token: queue ${queue ? queue.id : null}`,
+        null,
+        "server-action",
+        req.user?.id,
+      );
+      return res
+        .status(200)
+        .json({ id: consultation.id, status: consultation.status, queue });
     } catch (error) {
-      sails.config.customLogger.log('error', 'Error in getConsultationFromToken', { error: error?.message || error }, 'server-action', req.user?.id);
-      return res.status(500).json({ success: false, message: 'Something went wrong' });
+      sails.config.customLogger.log(
+        "error",
+        "Error in getConsultationFromToken",
+        { error: error?.message || error },
+        "server-action",
+        req.user?.id,
+      );
+      return res
+        .status(500)
+        .json({ success: false, message: "Something went wrong" });
     }
   },
 
@@ -1930,45 +3448,66 @@ module.exports = {
     const { delay, consultation: consultationId } = req.body;
 
     if (!delay || delay > 60 || delay < 0) {
-      return res.status(400).json({ message: 'invalidDelay' });
+      return res.status(400).json({ message: "invalidDelay" });
     }
 
     try {
       const doctorId = req.user.id;
       const doctor = req.user;
 
-      let consultation = await Consultation.findOne({ id: consultationId }).populate('invite');
+      let consultation = await Consultation.findOne({
+        id: consultationId,
+      }).populate("invite");
 
       if (!consultation) {
-        sails.config.customLogger.log('warn', `Consultation ${consultationId} not found`, null, 'message', req.user?.id);
-        return res.status(404).json({ message: 'Consultation not found' });
+        sails.config.customLogger.log(
+          "warn",
+          `Consultation ${consultationId} not found`,
+          null,
+          "message",
+          req.user?.id,
+        );
+        return res.status(404).json({ message: "Consultation not found" });
       }
 
-      if (consultation.status !== 'pending') {
-        sails.config.customLogger.log('warn', `Consultation ${consultationId} already started`, null, 'message', req.user?.id);
-        return res.status(400).json({ message: 'alreadyStarted' });
+      if (consultation.status !== "pending") {
+        sails.config.customLogger.log(
+          "warn",
+          `Consultation ${consultationId} already started`,
+          null,
+          "message",
+          req.user?.id,
+        );
+        return res.status(400).json({ message: "alreadyStarted" });
       }
 
-      await Consultation.updateOne({ id: consultationId, status: 'pending' }).set({
-        status: 'active',
+      await Consultation.updateOne({
+        id: consultationId,
+        status: "pending",
+      }).set({
+        status: "active",
         acceptedBy: doctorId,
         acceptedAt: new Date(),
         consultationEstimatedAt: new Date(new Date().getTime() + delay * 60000),
       });
 
-      consultation = await Consultation.findOne({ id: consultationId }).populate('invite');
-      const participants = await Consultation.getConsultationParticipants(consultation);
-      const decryptedConsultation = Consultation.decryptForBroadcast(consultation);
+      consultation = await Consultation.findOne({
+        id: consultationId,
+      }).populate("invite");
+      const participants =
+        await Consultation.getConsultationParticipants(consultation);
+      const decryptedConsultation =
+        Consultation.decryptForBroadcast(consultation);
 
       participants.forEach((participant) => {
-        sails.sockets.broadcast(participant, 'consultationAccepted', {
+        sails.sockets.broadcast(participant, "consultationAccepted", {
           data: {
             consultation: decryptedConsultation,
             _id: consultation.id,
             doctor: {
               firstName: doctor.firstName,
               lastName: doctor.lastName,
-              phoneNumber: doctor.phoneNumber ? doctor.phoneNumber : '',
+              phoneNumber: doctor.phoneNumber ? doctor.phoneNumber : "",
             },
           },
         });
@@ -1979,25 +3518,43 @@ module.exports = {
           ? consultation.invite.patientLanguage
           : sails.config.globals.DEFAULT_PATIENT_LOCALE;
 
-      const doctorDelayMsg = sails._t(patientLanguage, 'doctor delay in minutes', {
-        delay,
+      const doctorDelayMsg = sails._t(
         patientLanguage,
-        branding: process.env.BRANDING,
-      });
+        "doctor delay in minutes",
+        {
+          delay,
+          patientLanguage,
+          branding: process.env.BRANDING,
+        },
+      );
 
       const message = await Message.create({
         text: doctorDelayMsg,
         consultation: consultationId,
-        type: 'text',
+        type: "text",
         to: consultation.owner,
         from: doctorId,
       }).fetch();
 
-      sails.config.customLogger.log('verbose', `Consultation ${consultationId} planned: delay ${delay}`, null, 'message', req.user?.id);
-      return res.status(200).json({ message: 'success' });
+      sails.config.customLogger.log(
+        "verbose",
+        `Consultation ${consultationId} planned: delay ${delay}`,
+        null,
+        "message",
+        req.user?.id,
+      );
+      return res.status(200).json({ message: "success" });
     } catch (error) {
-      sails.config.customLogger.log('error', 'Error in planConsultation', { error: error?.message || error }, 'server-action', req.user?.id);
-      return res.status(500).json({ success: false, message: 'Something went wrong' });
+      sails.config.customLogger.log(
+        "error",
+        "Error in planConsultation",
+        { error: error?.message || error },
+        "server-action",
+        req.user?.id,
+      );
+      return res
+        .status(500)
+        .json({ success: false, message: "Something went wrong" });
     }
   },
 
@@ -2006,39 +3563,39 @@ module.exports = {
       const consultationId = escapeHtml(req.params.consultation);
       const { note } = req.body;
 
-      const updatedConsultation = await Consultation.updateOne({ id: consultationId }).set({ note });
+      const updatedConsultation = await Consultation.updateOne({
+        id: consultationId,
+      }).set({ note });
 
       if (!updatedConsultation) {
         sails.config.customLogger.log(
-          'warn',
+          "warn",
           `Consultation with ID ${consultationId} not found`,
           null,
-          'server-action',
-          req.user?.id
+          "server-action",
+          req.user?.id,
         );
-        return res.notFound({ error: 'Consultation not found' });
+        return res.notFound({ error: "Consultation not found" });
       }
 
       sails.config.customLogger.log(
-        'info',
+        "info",
         `Note updated for consultation ${consultationId}`,
         null,
-        'server-action',
-        req.user?.id
+        "server-action",
+        req.user?.id,
       );
 
-      return res.ok({ message: 'Consultation updated successfully' });
-
+      return res.ok({ message: "Consultation updated successfully" });
     } catch (err) {
       sails.config.customLogger.log(
-        'error',
+        "error",
         `Error updating note for consultation ${req.params.consultation}: ${err.message}`,
         err,
-        'server-action',
-        req.user?.id
+        "server-action",
+        req.user?.id,
       );
-      return res.serverError({ error: 'Internal server error' });
+      return res.serverError({ error: "Internal server error" });
     }
-  }
-
+  },
 };

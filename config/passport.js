@@ -71,15 +71,17 @@ passport.use(
     if (
       !isExpert && (
         invite.status === "ACCEPTED" ||
+        invite.status === "COMPLETE" ||
         invite.status === "COMPLETED" ||
-        invite.status === "REFUSED"
+        invite.status === "REFUSED" ||
+        invite.status === "CANCELED"
       )
     ) {
       sails.config.customLogger.log('info', `Invite already processed for invite ID: ${invite.id}`, null, 'message');
       return callback({ invite: "invite have already been accepted" }, null);
     }
 
-    if (invite.status === "SENT") {
+    if (!isExpert) {
       await PublicInvite.updateOne({ inviteToken: token }).set({
         status: "ACCEPTED",
       });

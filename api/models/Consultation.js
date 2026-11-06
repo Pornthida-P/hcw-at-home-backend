@@ -7,7 +7,7 @@ const columns = [
   { colName: 'Invite sent at', key: 'inviteCreatedAt' },
   { colName: 'Consultation scheduled at', key: 'inviteScheduledFor' },
   { colName: 'Waiting queue', key: 'queue.name' },
-  { colName: 'Patient jointed consultation at', key: 'consultationCreatedAt' },
+  { colName: 'Patient joined consultation at', key: 'consultationCreatedAt' },
   { colName: 'Consultation closed at', key: 'closedAt' },
   { colName: 'Total call with answer', key: 'successfulCallsCount' },
   { colName: 'Total call without answer', key: 'missedCallsCount' },
@@ -18,7 +18,7 @@ const columns = [
   { colName: 'Satisfaction message caregiver', key: 'doctorComment' },
   { colName: 'Department', key: 'acceptedBy.department' },
   { colName: 'Function', key: 'acceptedBy._function' },
-  { colName: 'caregiver ID', key: 'acceptedBy.id' },
+  { colName: 'Caregiver name', key: 'acceptedBy.name' },
   {
     colName: 'Number of participant joined',
     key: 'numberOfEffectiveParticipants',
@@ -32,6 +32,7 @@ const columns = [
   { colName: 'Translator name', key: 'interpreterName' },
   { colName: 'Handling estimated at', key: 'consultationEstimatedAt' },
   { colName: 'First call at', key: 'firstCallAt' },
+  { colName: 'Status', key: 'status' },
 ];
 
 module.exports = {
@@ -347,17 +348,16 @@ module.exports = {
     if (consultation.invitationToken) {
       await PublicInvite.updateOne({
         inviteToken: consultation.invitationToken,
-      }).set({ status: 'SENT' });
-      sails.config.customLogger.log('info', `Public invite status updated to SENT for consultation ${consultation?.id}`, null, 'server-action', null);
+      }).set({ status: 'CANCELED' });
+      sails.config.customLogger.log('info', `Public invite status updated to CANCELED for consultation ${consultation?.id}`, null, 'server-action', null);
     }
-    sails.sockets.broadcast(
-      consultation.queue || consultation.doctor,
-      'consultationCanceled',
-      {
+    // Tell the queue and the assigned doctor, so it leaves every waiting room
+    _.uniq([consultation.queue, consultation.doctor, consultation.acceptedBy].filter(Boolean).map(String)).forEach((room) => {
+      sails.sockets.broadcast(room, 'consultationCanceled', {
         event: 'consultationCanceled',
         data: { _id: criteria.where.id, consultation: criteria.where },
-      }
-    );
+      });
+    });
     sails.config.customLogger.log('info', `Consultation with id ${consultation.id} cancellation broadcast`, null, 'server-action', null);
     return proceed();
   },
@@ -457,15 +457,9 @@ module.exports = {
       const queueId = consultation.queue.toString ? consultation.queue.toString() : consultation.queue;
       const queue = await Queue.findOne({ id: queueId });
       if (queue && queue.shareWhenOpened) {
-        const doctorsAndAdmins = await User.find({
-          or: [
-            { role: 'doctor' },
-            { role: 'admin' }
-          ]
-        });
-
-        doctorsAndAdmins.forEach(user => {
-          participantSet.add(user.id);
+        const queueUsers = await Queue.getQueueUsers(queue.id);
+        queueUsers.forEach(user => {
+          participantSet.add(user._id.toString());
         });
       }
     }
@@ -616,8 +610,12 @@ module.exports = {
     return anonymousConsultation;
   },
 
-  async sendConsultationClosed(consultation) {
-    const participants = await Consultation.getConsultationParticipants(consultation);
+  async sendConsultationClosed(consultation, previousStatus) {
+    // A consultation closed while still pending must also reach its queue,
+    // otherwise it stays in the other doctors' waiting rooms.
+    const participants = await Consultation.getConsultationParticipants(
+      Object.assign({}, consultation, { status: previousStatus || consultation.status })
+    );
 
     if (consultation.experts && consultation.experts.length > 0) {
       const populatedExpertsRaw = await User.find({ id: consultation.experts });
@@ -649,6 +647,7 @@ module.exports = {
     }
     const db = Consultation.getDatastore().manager;
     const closedAt = new Date();
+    const previousStatus = consultation.status;
 
     try {
       const anonymousConsultation = await Consultation.getAnonymousDetails(consultation);
@@ -733,7 +732,7 @@ module.exports = {
     consultation.closedAtISO = closedAt;
     consultation.closedAt = closedAt.getTime();
 
-    await Consultation.sendConsultationClosed(consultation);
+    await Consultation.sendConsultationClosed(consultation, previousStatus);
     sails.config.customLogger.log('info', `Consultation closed event emitted for consultation id ${consultation.id}`, null, 'server-action', null);
   },
 
@@ -890,10 +889,10 @@ module.exports = {
 
   getConsultationReport(consultation) {
     if (consultation.owner) {
-      consultation.owner.name = `${consultation.owner.firstName} ${consultation.owner.lastName}`;
+      consultation.owner.name = [consultation.owner.firstName, consultation.owner.lastName].filter(Boolean).join(' ') || consultation.owner.email || '';
     }
     if (consultation.acceptedBy) {
-      consultation.acceptedBy.name = `${consultation.acceptedBy.firstName} ${consultation.acceptedBy.lastName}`;
+      consultation.acceptedBy.name = [consultation.acceptedBy.firstName, consultation.acceptedBy.lastName].filter(Boolean).join(' ') || consultation.acceptedBy.email || '';
     }
     const mappedConsultation = {};
     const dateFields = [
@@ -915,8 +914,14 @@ module.exports = {
     columns.forEach((col) => {
       let value = _.get(consultation, col.key);
 
-      if (dateFields.includes(col.key) && typeof value === 'number' && value) {
-        value = moment(value).format('MM/DD/YYYY HH:mm:ss');
+      if (dateFields.includes(col.key)) {
+        // Missing dates are stored as 0: export them as an empty cell
+        value = typeof value === 'number' && value ? moment(value).format('MM/DD/YYYY HH:mm:ss') : '';
+      } else if (col.key === 'averageCallDuration' && !consultation.successfulCallsCount) {
+        // No answered call: there is no call average
+        value = '';
+      } else if (value === undefined || value === null) {
+        value = '';
       }
       mappedConsultation[col.colName] = value;
     });

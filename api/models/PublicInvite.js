@@ -1,8 +1,9 @@
 const ics = require('ics');
 const moment = require('moment-timezone');
-moment.locale('fr');
+moment.locale('en');
 const crypto = require('crypto');
 const { parseTime } = require('../utils/helpers');
+const { getExpertInvitationURL } = require('../utils/invite-urls');
 
 
 function parseTimeOverride(envVar) {
@@ -746,7 +747,7 @@ module.exports = {
       return;
     }
 
-    const expertLink = `${process.env.PUBLIC_URL}/inv/?invite=${invite.expertToken}`;
+    const expertLink = getExpertInvitationURL(invite.expertToken);
     const locale = invite.patientLanguage || sails.config.globals.DEFAULT_PATIENT_LOCALE;
     const timezone = invite.patientTZ || 'UTC';
     const inviteTime = invite.scheduledFor
@@ -872,7 +873,7 @@ module.exports = {
   },
 
   getExpertReminderMessage(invite) {
-    const url = `${process.env.PUBLIC_URL}/inv/?invite=${invite.expertToken}`;
+    const url = getExpertInvitationURL(invite.expertToken);
     const locale = invite.patientLanguage || sails.config.globals.DEFAULT_PATIENT_LOCALE;
     const timezone = invite.patientTZ || 'UTC';
     const inviteTime = invite.scheduledFor
@@ -1315,6 +1316,20 @@ module.exports = {
     }
 
     sails.config.customLogger.log('info', `setExpertInviteReminders: Completed scheduling expert reminders ${invite.id}`, null, 'message');
+  },
+
+  async cancelPatientInvite(invite, userId) {
+    // Soft-cancel: keep the row so the patient link can show a clear
+    // "invitation canceled" message instead of a generic not-found/expired.
+    const relatedIds = [invite.guestInvite, invite.translatorRequestInvite, invite.translatorInvite]
+      .filter(Boolean);
+    for (const id of relatedIds) {
+      await PublicInvite.updateOne({ id }).set({ status: 'CANCELED' });
+      sails.config.customLogger.log('info', `cancelPatientInvite: Marked related invite ${id} as CANCELED`, null, 'server-action', userId);
+    }
+    await PublicInvite.updateOne({ id: invite.id }).set({ status: 'CANCELED' });
+    sails.config.customLogger.log('info', `cancelPatientInvite: Marked invite ${invite.id} as CANCELED`, null, 'server-action', userId);
+    return invite;
   },
 
   async destroyPatientInvite(invite, userId) {
