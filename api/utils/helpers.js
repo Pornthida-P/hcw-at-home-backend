@@ -97,7 +97,16 @@ async function recreateTTLIndex(collection, field, expireAfterSeconds) {
 
 function cleanPhoneNumberForTwilio(number) {
   let cleaned = number.replace(/[^+\d]/g, '');
-  if (!cleaned.startsWith('+')) {
+  
+  if (cleaned.startsWith('+')) {
+    return cleaned;
+  }
+  
+  const defaultCountryCode = process.env.DEFAULT_PHONE_COUNTRY_CODE || '66';
+  
+  if (cleaned.startsWith('0') && defaultCountryCode) {
+    cleaned = `+${defaultCountryCode}${cleaned.substring(1)}`;
+  } else if (!cleaned.startsWith('+')) {
     cleaned = `+${cleaned}`;
   }
 

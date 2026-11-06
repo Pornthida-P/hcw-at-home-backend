@@ -5,8 +5,12 @@ const validator = require('validator');
 const Joi = require('joi');
 const { i18n } = require('../../config/i18n');
 const { escapeHtml } = require('../utils/helpers');
+const bcrypt = require('bcrypt');
+const crypto = require('crypto');
 
 const SMS_CODE_LIFESPAN = 5 * 60;
+const PASSWORD_RESET_TOKEN_EXPIRY = process.env.PASSWORD_RESET_TOKEN_EXPIRY || '5m';
+const ACTIVATION_TOKEN_EXPIRY = process.env.ACTIVATION_TOKEN_EXPIRY || '24h';
 
 // Roles allowed to use each front-end application. The front-ends send their
 // name (`_app` in login bodies, `app` in GET /current-user) so that a session
@@ -85,6 +89,18 @@ function generateVerificationCode() {
     string += possible.charAt(Math.floor(Math.random() * possible.length));
   }
   return string;
+}
+
+async function hashToken(token) {
+  return bcrypt.hash(token, 10);
+}
+
+async function verifyToken(plainToken, hashedToken) {
+  return bcrypt.compare(plainToken, hashedToken);
+}
+
+function generateSecureToken() {
+  return crypto.randomBytes(32).toString('hex');
 }
 
 const canLoginLocal = async (req) => {
@@ -186,34 +202,42 @@ module.exports = {
           .limit(1)
           .toArray()
       )[0];
-      const appSecret = process.env.APP_SECRET || sails.config.globals.APP_SECRET;
-      const resetPasswordToken = jwt.sign(
-        { email: req.body.email.toLowerCase() },
-        appSecret,
-        { expiresIn: SMS_CODE_LIFESPAN }
-      );
+      
       res.json({ success: true });
+      
       if (user) {
         try {
+          const plainToken = generateSecureToken();
+          const hashedToken = await hashToken(plainToken);
+          
           await db.collection("user").updateOne(
             { _id: user._id },
-            { $set: { resetPasswordToken } }
+            { $set: { resetPasswordToken: hashedToken } }
           );
           sails.config.customLogger.log('info', `User ${user._id} updated with resetPasswordToken.`, null, 'server-action', user?._id);
-        } catch (updateError) {
-          sails.config.customLogger.log('error', `Error updating user ${user._id} with resetPasswordToken: ${updateError.message}`, null, 'server-action', user?._id);
-        }
-        const url = `${process.env.DOCTOR_URL}/app/reset-password?token=${resetPasswordToken}`;
-        const doctorLanguage = user.preferredLanguage || process.env.DEFAULT_DOCTOR_LOCALE;
-        try {
+          
+          const appSecret = process.env.APP_SECRET || sails.config.globals.APP_SECRET;
+          const jwtToken = jwt.sign(
+            { 
+              email: user.email.toLowerCase(),
+              token: plainToken,
+              type: 'password-reset'
+            },
+            appSecret,
+            { expiresIn: PASSWORD_RESET_TOKEN_EXPIRY }
+          );
+          
+          const url = `${process.env.DOCTOR_URL}/reset-password?token=${jwtToken}`;
+          const doctorLanguage = user.preferredLanguage || process.env.DEFAULT_DOCTOR_LOCALE;
+          
           await sails.helpers.email.with({
             to: user.email,
             subject: sails._t(doctorLanguage, "forgot password email subject", { url }),
             text: sails._t(doctorLanguage, "forgot password email", { url }),
           });
           sails.config.customLogger.log('info', `Forgot password email sent to user ${user._id}.`, null, 'server-action', user?._id);
-        } catch (emailError) {
-          sails.config.customLogger.log('error', `Error sending forgot password email to user ${user._id}: ${emailError.message}`, null, 'server-action', user?._id);
+        } catch (updateError) {
+          sails.config.customLogger.log('error', `Error in forgotPassword flow for user ${user._id}: ${updateError.message}`, null, 'server-action', user?._id);
         }
       } else {
         sails.config.customLogger.log('info', 'Forgot password requested for non-existent user.', null, 'message', null);
@@ -233,24 +257,62 @@ module.exports = {
       sails.config.customLogger.log('warn', 'resetPassword attempted with weak password.', null, 'message', null);
       return res.status(400).json({ message: 'password-too-weak' });
     }
+    
     try {
-      const password = await User.generatePassword(req.body.password);
-      const token = validator.escape(req.body.token).trim();
-      const user = await User.findOne({ resetPasswordToken: token });
-      await User.updateOne({ resetPasswordToken: token }).set({ password, resetPasswordToken: '' });
-      sails.config.customLogger.log('info', `Password reset processed for user ${user?._id || user?.id}.`, null, 'server-action', user?._id || user?.id);
-      if (!user) {
-        throw new Error('token-expired');
+      const jwtToken = validator.escape(req.body.token).trim();
+      const appSecret = process.env.APP_SECRET || sails.config.globals.APP_SECRET;
+      
+      let decoded;
+      try {
+        decoded = jwt.verify(jwtToken, appSecret);
+      } catch (jwtErr) {
+        sails.config.customLogger.log('warn', `Invalid or expired JWT token in resetPassword`, null, 'message', null);
+        if (jwtErr.name === 'TokenExpiredError') {
+          return res.status(400).json({ message: 'token-expired' });
+        }
+        return res.status(400).json({ message: 'invalid-token' });
       }
+      
+      if (decoded.type !== 'password-reset') {
+        sails.config.customLogger.log('warn', `Wrong token type in resetPassword: ${decoded.type}`, null, 'message', null);
+        return res.status(400).json({ message: 'invalid-token' });
+      }
+      
+      const db = User.getDatastore().manager;
+      const userCollection = db.collection("user");
+      const user = (
+        await userCollection
+          .find({ email: decoded.email })
+          .collation({ locale: "en", strength: 1 })
+          .limit(1)
+          .toArray()
+      )[0];
+      
+      if (!user || !user.resetPasswordToken) {
+        sails.config.customLogger.log('warn', `Reset token not found or already used for ${decoded.email}`, null, 'message', null);
+        return res.status(400).json({ message: 'token-expired' });
+      }
+      
+      const tokenValid = await verifyToken(decoded.token, user.resetPasswordToken);
+      if (!tokenValid) {
+        sails.config.customLogger.log('warn', `Token mismatch in resetPassword for ${decoded.email}`, null, 'message', null);
+        return res.status(400).json({ message: 'invalid-token' });
+      }
+      
+      const hashedPassword = await User.generatePassword(req.body.password);
+      
+      await userCollection.updateOne(
+        { _id: user._id },
+        { $set: { password: hashedPassword, resetPasswordToken: '' } }
+      );
+      
+      sails.config.customLogger.log('info', `Password reset successful for user ${user._id}`, null, 'server-action', user._id);
+      return res.json({ success: true });
+      
     } catch (err) {
       sails.config.customLogger.log('error', `Error in resetPassword: ${err.message}`, null, 'server-action', null);
-      if (err.name === 'TokenExpiredError') {
-        return res.status(400).json({ message: 'token-expired' });
-      } else {
-        return res.status(400).json({ message: 'unknown' });
-      }
+      return res.status(500).json({ message: 'server-error' });
     }
-    res.json({ success: true });
   },
 
   async loginLocal(req, res) {
@@ -910,5 +972,138 @@ module.exports = {
         }
       }
     );
+  },
+
+  async activateAccount(req, res) {
+    const passwordFormat = new RegExp('^(((?=.*[a-z])(?=.*[A-Z]))|((?=.*[a-z])(?=.*[0-9]))|((?=.*[A-Z])(?=.*[0-9])))(?=.{6,})');
+    
+    if (!req.body.token) {
+      sails.config.customLogger.log('warn', 'activateAccount attempted without token.', null, 'message', null);
+      return res.status(400).json({ message: 'token-missing' });
+    }
+    if (!passwordFormat.test(req.body.password)) {
+      sails.config.customLogger.log('warn', 'activateAccount attempted with weak password.', null, 'message', null);
+      return res.status(400).json({ message: 'password-too-weak' });
+    }
+    
+    try {
+      const jwtToken = validator.escape(req.body.token).trim();
+      const appSecret = process.env.APP_SECRET || sails.config.globals.APP_SECRET;
+      
+      let decoded;
+      try {
+        decoded = jwt.verify(jwtToken, appSecret);
+      } catch (jwtErr) {
+        sails.config.customLogger.log('warn', `Invalid or expired JWT token in activateAccount`, null, 'message', null);
+        if (jwtErr.name === 'TokenExpiredError') {
+          return res.status(400).json({ message: 'token-expired' });
+        }
+        return res.status(400).json({ message: 'invalid-token' });
+      }
+      
+      if (decoded.type !== 'account-activation') {
+        sails.config.customLogger.log('warn', `Wrong token type in activateAccount: ${decoded.type}`, null, 'message', null);
+        return res.status(400).json({ message: 'invalid-token' });
+      }
+      
+      const db = User.getDatastore().manager;
+      const userCollection = db.collection("user");
+      const user = (
+        await userCollection
+          .find({ email: decoded.email })
+          .collation({ locale: "en", strength: 1 })
+          .limit(1)
+          .toArray()
+      )[0];
+      
+      if (!user || !user.activationToken) {
+        sails.config.customLogger.log('warn', `Activation token not found or already used for ${decoded.email}`, null, 'message', null);
+        return res.status(400).json({ message: 'token-expired' });
+      }
+      
+      const tokenValid = await verifyToken(decoded.token, user.activationToken);
+      if (!tokenValid) {
+        sails.config.customLogger.log('warn', `Token mismatch in activateAccount for ${decoded.email}`, null, 'message', null);
+        return res.status(400).json({ message: 'invalid-token' });
+      }
+      
+      const hashedPassword = await User.generatePassword(req.body.password);
+      
+      await userCollection.updateOne(
+        { _id: user._id },
+        { $set: { password: hashedPassword, activationToken: '', isActivated: true } }
+      );
+      
+      sails.config.customLogger.log('info', `Account activated successfully for user ${user._id}`, null, 'server-action', user._id);
+      return res.json({ success: true });
+      
+    } catch (err) {
+      sails.config.customLogger.log('error', `Error in activateAccount: ${err.message}`, null, 'server-action', null);
+      return res.status(500).json({ message: 'server-error' });
+    }
+  },
+
+  async sendPasswordReset(req, res) {
+    if (!req.user || req.user.role !== 'admin') {
+      sails.config.customLogger.log('warn', 'sendPasswordReset attempted by non-admin user', null, 'message', req.user?.id);
+      return res.status(403).json({ message: 'forbidden' });
+    }
+    
+    const userId = validator.escape(req.params.userId).trim();
+    if (!userId) {
+      sails.config.customLogger.log('warn', 'sendPasswordReset attempted without userId', null, 'message', req.user?.id);
+      return res.status(400).json({ message: 'userId-required' });
+    }
+    
+    try {
+      const db = User.getDatastore().manager;
+      const userCollection = db.collection("user");
+      const user = await User.findOne({ id: userId });
+      
+      if (!user) {
+        sails.config.customLogger.log('warn', `sendPasswordReset: User ${userId} not found`, null, 'message', req.user?.id);
+        return res.status(404).json({ message: 'user-not-found' });
+      }
+      
+      if (!['admin', 'doctor', 'nurse', 'scheduler'].includes(user.role)) {
+        sails.config.customLogger.log('warn', `sendPasswordReset: Invalid role ${user.role} for user ${userId}`, null, 'message', req.user?.id);
+        return res.status(400).json({ message: 'invalid-role' });
+      }
+      
+      const plainToken = generateSecureToken();
+      const hashedToken = await hashToken(plainToken);
+      
+      await userCollection.updateOne(
+        { _id: user._id },
+        { $set: { resetPasswordToken: hashedToken } }
+      );
+      
+      const appSecret = process.env.APP_SECRET || sails.config.globals.APP_SECRET;
+      const jwtToken = jwt.sign(
+        { 
+          email: user.email.toLowerCase(),
+          token: plainToken,
+          type: 'password-reset'
+        },
+        appSecret,
+        { expiresIn: PASSWORD_RESET_TOKEN_EXPIRY }
+      );
+      
+      const url = `${process.env.DOCTOR_URL}/reset-password?token=${jwtToken}`;
+      const doctorLanguage = user.preferredLanguage || process.env.DEFAULT_DOCTOR_LOCALE;
+      
+      await sails.helpers.email.with({
+        to: user.email,
+        subject: sails._t(doctorLanguage, "forgot password email subject", { url }),
+        text: sails._t(doctorLanguage, "forgot password email", { url }),
+      });
+      
+      sails.config.customLogger.log('info', `Admin ${req.user.id} sent password reset to user ${user._id}`, null, 'server-action', req.user.id);
+      return res.json({ success: true });
+      
+    } catch (err) {
+      sails.config.customLogger.log('error', `Error in sendPasswordReset: ${err.message}`, null, 'server-action', req.user?.id);
+      return res.status(500).json({ message: 'server-error' });
+    }
   }
 };

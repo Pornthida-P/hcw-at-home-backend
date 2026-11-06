@@ -112,6 +112,8 @@ module.exports.policies = {
     metadata: true,
     forgotPassword: true,
     resetPassword: true,
+    activateAccount: true,
+    sendPasswordReset: ["isLoggedIn", "isAdmin"],
     getCurrentUser: true,
     getConfig: true,
     logout: true,

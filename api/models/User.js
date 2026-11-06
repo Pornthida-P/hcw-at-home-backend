@@ -41,6 +41,14 @@ module.exports = {
       type: 'string',
       required: false
     },
+    activationToken: {
+      type: 'string',
+      required: false
+    },
+    isActivated: {
+      type: 'boolean',
+      defaultsTo: true
+    },
     phoneNumber: {
       type: 'string'
     },
