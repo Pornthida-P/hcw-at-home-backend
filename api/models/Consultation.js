@@ -649,6 +649,13 @@ module.exports = {
     const closedAt = new Date();
     const previousStatus = consultation.status;
 
+    consultation.status = 'closed';
+    consultation.closedAtISO = closedAt;
+    consultation.closedAt = closedAt.getTime();
+    if (userId) {
+      consultation.closedBy = userId;
+    }
+
     try {
       const anonymousConsultation = await Consultation.getAnonymousDetails(consultation);
       await AnonymousConsultation.create(anonymousConsultation);
@@ -730,13 +737,6 @@ module.exports = {
       sails.config.customLogger.log('info', `Messages updated with consultation closed timestamps for consultation id ${consultation.id}`, null,'server-action', null);
     } catch (error) {
       sails.config.customLogger.log('error', `Error updating messages with consultation closed timestamps for consultation id ${consultation.id}`, { error: error?.message || error }, 'server-action', null);
-    }
-
-    consultation.status = 'closed';
-    consultation.closedAtISO = closedAt;
-    consultation.closedAt = closedAt.getTime();
-    if (userId) {
-      consultation.closedBy = userId;
     }
 
     await Consultation.sendConsultationClosed(consultation, previousStatus);

@@ -9,25 +9,29 @@ This directory contains regression tests for the HCW@Home backend.
 
 ## Running Tests
 
-Tests are currently placeholders awaiting a test framework setup. To run these tests:
+The test suite uses Mocha, Chai, and Sinon. Dependencies are already installed.
 
-1. Install a test framework (e.g., Mocha):
-   ```bash
-   npm install --save-dev mocha chai supertest
-   ```
+### Run all tests:
+```bash
+npx mocha test/**/*.test.js
+```
 
-2. Update `package.json` to include test command:
-   ```json
-   "scripts": {
-     "test": "mocha test/**/*.test.js",
-     "test:integration": "mocha test/integration/*.test.js"
-   }
-   ```
+### Run only consultation close tests:
+```bash
+npx mocha test/integration/consultation-close.test.js
+```
 
-3. Run tests:
-   ```bash
-   npm test
-   ```
+### Run with npm script:
+```bash
+npm run test:integration
+```
+
+To add this to package.json scripts:
+```json
+"scripts": {
+  "test:integration": "mocha test/integration/*.test.js"
+}
+```
 
 ## Manual Testing
 
