@@ -5,6 +5,7 @@ const validator = require('validator');
 const Joi = require('joi');
 const { i18n } = require('../../config/i18n');
 const { escapeHtml } = require('../utils/helpers');
+const { rateLimitMiddleware } = require('../utils/rate-limiter');
 const bcrypt = require('bcrypt');
 const crypto = require('crypto');
 
@@ -182,74 +183,77 @@ module.exports = {
     }
   },
 
-  async forgotPassword(req, res) {
-    try {
+  forgotPassword(req, res) {
+    return rateLimitMiddleware('FORGOT_PASSWORD')(req, res, async () => {
       try {
-        User.validate("email", req.body.email);
-      } catch (error) {
-        sails.config.customLogger.log('warn', 'Invalid email provided for forgotPassword.', null, 'message', null);
-        return res.status(401).json({ message: "Email is invalid" });
-      }
-      const db = User.getDatastore().manager;
-      const userCollection = db.collection("user");
-      const user = (
-        await userCollection
-          .find({
-            email: req.body.email,
-            role: { $in: ["admin", "doctor", "nurse"] },
-          })
-          .collation({ locale: "en", strength: 1 })
-          .limit(1)
-          .toArray()
-      )[0];
-      
-      res.json({ success: true });
-      
-      if (user) {
         try {
-          const plainToken = generateSecureToken();
-          const hashedToken = await hashToken(plainToken);
-          
-          await db.collection("user").updateOne(
-            { _id: user._id },
-            { $set: { resetPasswordToken: hashedToken } }
-          );
-          sails.config.customLogger.log('info', `User ${user._id} updated with resetPasswordToken.`, null, 'server-action', user?._id);
-          
-          const appSecret = process.env.APP_SECRET || sails.config.globals.APP_SECRET;
-          const jwtToken = jwt.sign(
-            { 
-              email: user.email.toLowerCase(),
-              token: plainToken,
-              type: 'password-reset'
-            },
-            appSecret,
-            { expiresIn: PASSWORD_RESET_TOKEN_EXPIRY }
-          );
-          
-          const url = `${process.env.DOCTOR_URL}/reset-password?token=${jwtToken}`;
-          const doctorLanguage = user.preferredLanguage || process.env.DEFAULT_DOCTOR_LOCALE;
-          
-          await sails.helpers.email.with({
-            to: user.email,
-            subject: sails._t(doctorLanguage, "forgot password email subject", { url }),
-            text: sails._t(doctorLanguage, "forgot password email", { url }),
-          });
-          sails.config.customLogger.log('info', `Forgot password email sent to user ${user._id}.`, null, 'server-action', user?._id);
-        } catch (updateError) {
-          sails.config.customLogger.log('error', `Error in forgotPassword flow for user ${user._id}: ${updateError.message}`, null, 'server-action', user?._id);
+          User.validate("email", req.body.email);
+        } catch (error) {
+          sails.config.customLogger.log('warn', 'Invalid email provided for forgotPassword.', null, 'message', null);
+          return res.status(401).json({ message: "Email is invalid" });
         }
-      } else {
-        sails.config.customLogger.log('info', 'Forgot password requested for non-existent user.', null, 'message', null);
+        const db = User.getDatastore().manager;
+        const userCollection = db.collection("user");
+        const user = (
+          await userCollection
+            .find({
+              email: req.body.email,
+              role: { $in: ["admin", "doctor", "nurse"] },
+            })
+            .collation({ locale: "en", strength: 1 })
+            .limit(1)
+            .toArray()
+        )[0];
+        
+        res.json({ success: true });
+        
+        if (user) {
+          try {
+            const plainToken = generateSecureToken();
+            const hashedToken = await hashToken(plainToken);
+            
+            await db.collection("user").updateOne(
+              { _id: user._id },
+              { $set: { resetPasswordToken: hashedToken } }
+            );
+            sails.config.customLogger.log('info', `User ${user._id} updated with resetPasswordToken.`, null, 'server-action', user?._id);
+            
+            const appSecret = process.env.APP_SECRET || sails.config.globals.APP_SECRET;
+            const jwtToken = jwt.sign(
+              { 
+                email: user.email.toLowerCase(),
+                token: plainToken,
+                type: 'password-reset'
+              },
+              appSecret,
+              { expiresIn: PASSWORD_RESET_TOKEN_EXPIRY }
+            );
+            
+            const url = `${process.env.DOCTOR_URL}/reset-password?token=${jwtToken}`;
+            const doctorLanguage = user.preferredLanguage || process.env.DEFAULT_DOCTOR_LOCALE;
+            
+            await sails.helpers.email.with({
+              to: user.email,
+              subject: sails._t(doctorLanguage, "forgot password email subject", { url }),
+              text: sails._t(doctorLanguage, "forgot password email", { url }),
+            });
+            sails.config.customLogger.log('info', `Forgot password email sent to user ${user._id}.`, null, 'server-action', user?._id);
+          } catch (updateError) {
+            sails.config.customLogger.log('error', `Error in forgotPassword flow for user ${user._id}: ${updateError.message}`, null, 'server-action', user?._id);
+          }
+        } else {
+          sails.config.customLogger.log('info', 'Forgot password requested for non-existent user.', null, 'message', null);
+        }
+      } catch (error) {
+        sails.config.customLogger.log('error', `Unexpected error in forgotPassword: ${error?.message || error}`, null, 'server-action', null);
       }
-    } catch (error) {
-      sails.config.customLogger.log('error', `Unexpected error in forgotPassword: ${error?.message || error}`, null, 'server-action', null);
-    }
+    });
   },
 
-  async resetPassword(req, res) {
-    const passwordFormat = new RegExp('^(((?=.*[a-z])(?=.*[A-Z]))|((?=.*[a-z])(?=.*[0-9]))|((?=.*[A-Z])(?=.*[0-9])))(?=.{6,})');
-    if (!req.body.token) {
+  resetPassword(req, res) {
+    return rateLimitMiddleware('RESET_PASSWORD')(req, res, async () => {
+      const passwordFormat = new RegExp('^(((?=.*[a-z])(?=.*[A-Z]))|((?=.*[a-z])(?=.*[0-9]))|((?=.*[A-Z])(?=.*[0-9])))(?=.{6,})');
+      if (!req.body.token) {
       sails.config.customLogger.log('warn', 'resetPassword attempted without token.', null, 'message', null);
       return res.status(400).json({ message: 'token-missing' });
     }
@@ -301,10 +305,18 @@ module.exports = {
       
       const hashedPassword = await User.generatePassword(req.body.password);
       
-      await userCollection.updateOne(
-        { _id: user._id },
+      const updateResult = await userCollection.updateOne(
+        { 
+          _id: user._id,
+          resetPasswordToken: user.resetPasswordToken
+        },
         { $set: { password: hashedPassword, resetPasswordToken: '' } }
       );
+      
+      if (updateResult.matchedCount === 0) {
+        sails.config.customLogger.log('warn', `Token already used in parallel request for ${decoded.email}`, null, 'message', null);
+        return res.status(400).json({ message: 'token-expired' });
+      }
       
       sails.config.customLogger.log('info', `Password reset successful for user ${user._id}`, null, 'server-action', user._id);
       return res.json({ success: true });
@@ -313,6 +325,7 @@ module.exports = {
       sails.config.customLogger.log('error', `Error in resetPassword: ${err.message}`, null, 'server-action', null);
       return res.status(500).json({ message: 'server-error' });
     }
+    });
   },
 
   async loginLocal(req, res) {
@@ -974,10 +987,11 @@ module.exports = {
     );
   },
 
-  async activateAccount(req, res) {
-    const passwordFormat = new RegExp('^(((?=.*[a-z])(?=.*[A-Z]))|((?=.*[a-z])(?=.*[0-9]))|((?=.*[A-Z])(?=.*[0-9])))(?=.{6,})');
-    
-    if (!req.body.token) {
+  activateAccount(req, res) {
+    return rateLimitMiddleware('ACTIVATE_ACCOUNT')(req, res, async () => {
+      const passwordFormat = new RegExp('^(((?=.*[a-z])(?=.*[A-Z]))|((?=.*[a-z])(?=.*[0-9]))|((?=.*[A-Z])(?=.*[0-9])))(?=.{6,})');
+      
+      if (!req.body.token) {
       sails.config.customLogger.log('warn', 'activateAccount attempted without token.', null, 'message', null);
       return res.status(400).json({ message: 'token-missing' });
     }
@@ -1029,10 +1043,18 @@ module.exports = {
       
       const hashedPassword = await User.generatePassword(req.body.password);
       
-      await userCollection.updateOne(
-        { _id: user._id },
+      const updateResult = await userCollection.updateOne(
+        { 
+          _id: user._id,
+          activationToken: user.activationToken
+        },
         { $set: { password: hashedPassword, activationToken: '', isActivated: true } }
       );
+      
+      if (updateResult.matchedCount === 0) {
+        sails.config.customLogger.log('warn', `Token already used in parallel request for ${decoded.email}`, null, 'message', null);
+        return res.status(400).json({ message: 'token-expired' });
+      }
       
       sails.config.customLogger.log('info', `Account activated successfully for user ${user._id}`, null, 'server-action', user._id);
       return res.json({ success: true });
@@ -1041,9 +1063,11 @@ module.exports = {
       sails.config.customLogger.log('error', `Error in activateAccount: ${err.message}`, null, 'server-action', null);
       return res.status(500).json({ message: 'server-error' });
     }
+    });
   },
 
-  async sendPasswordReset(req, res) {
+  sendPasswordReset(req, res) {
+    return rateLimitMiddleware('ADMIN_SEND_RESET')(req, res, async () => {
     if (!req.user || req.user.role !== 'admin') {
       sails.config.customLogger.log('warn', 'sendPasswordReset attempted by non-admin user', null, 'message', req.user?.id);
       return res.status(403).json({ message: 'forbidden' });
@@ -1105,5 +1129,6 @@ module.exports = {
       sails.config.customLogger.log('error', `Error in sendPasswordReset: ${err.message}`, null, 'server-action', req.user?.id);
       return res.status(500).json({ message: 'server-error' });
     }
+    });
   }
 };
