@@ -41,6 +41,14 @@ module.exports = {
       type: 'string',
       required: false
     },
+    activationToken: {
+      type: 'string',
+      required: false
+    },
+    isActivated: {
+      type: 'boolean',
+      defaultsTo: true
+    },
     phoneNumber: {
       type: 'string'
     },
@@ -234,6 +242,23 @@ module.exports = {
     } catch (e) {
       sails.config.customLogger.log('error', 'User beforeUpdate: Unexpected error', { error: e?.message }, 'server-action', null);
       return proceed(e);
+    }
+  },
+
+  async afterCreate(user, proceed) {
+    try {
+      if (!user.password && user.email && ['admin', 'doctor', 'nurse', 'scheduler'].includes(user.role)) {
+        sails.config.customLogger.log('info', `User afterCreate: Sending activation email for user ${user.id}`, null, 'server-action', user.id);
+        try {
+          await sails.helpers.sendActivationEmail.with({ user });
+        } catch (emailError) {
+          sails.config.customLogger.log('error', `User afterCreate: Failed to send activation email for user ${user.id}: ${emailError.message}`, null, 'server-action', user.id);
+        }
+      }
+      return proceed();
+    } catch (error) {
+      sails.config.customLogger.log('error', 'User afterCreate: Unexpected error', { error: error.message }, 'server-action', null);
+      return proceed(error);
     }
   }
 

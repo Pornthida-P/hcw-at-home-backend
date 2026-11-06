@@ -72,6 +72,8 @@ module.exports.routes = {
   "POST /api/v1/login-local": "AuthController.loginLocal",
   "POST /api/v1/forgot-password": "AuthController.forgotPassword",
   "POST /api/v1/reset-password": "AuthController.resetPassword",
+  "POST /api/v1/activate-account": "AuthController.activateAccount",
+  "POST /api/v1/admin/send-password-reset/:userId": "AuthController.sendPasswordReset",
   "POST /api/v1/login-invite": "AuthController.loginInvite",
   "GET /api/v1/login-openid": "AuthController.loginOpenId",
   "GET /api/v1/login-openid/callback": "AuthController.loginOpenIdReturn",

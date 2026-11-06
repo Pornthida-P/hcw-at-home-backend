@@ -324,6 +324,12 @@ passport.use(
             sails.config.customLogger.log('error', `Local strategy: User with MongoID: ${user.id} is not approved`, null, 'message');
             return cb(new Error('User is not approved'));
           }
+          if (user && user.hasOwnProperty('isActivated') && user.isActivated === false) {
+            sails.config.customLogger.log('error', `Local strategy: User with MongoID: ${user.id} is not activated`, null, 'message');
+            return cb(null, false, {
+              message: sails._t(locale, 'account not activated'),
+            });
+          }
           bcrypt.compare(password, user.password, (err, res) => {
             if (err) {
               sails.config.customLogger.log('error', `Local strategy: Error comparing password for user with MongoID: ${user.id}`, err, 'server-action');
