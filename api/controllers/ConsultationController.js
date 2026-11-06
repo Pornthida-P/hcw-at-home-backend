@@ -1775,10 +1775,6 @@ module.exports = {
         );
       }
 
-      await Consultation.updateOne({ id: consultationId }).set({
-        closedBy: req.user.id,
-      });
-
       await Consultation.closeConsultation(consultation, req.user?.id);
       sails.config.customLogger.log(
         "info",
