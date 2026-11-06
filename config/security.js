@@ -35,8 +35,6 @@ module.exports.security = {
       "http://localhost:8100",
       "http://localhost:36165",
       "http://localhost:4200",
-      "http://localhost:4201",
-      "http://localhost:4202",
       "http://localhost:4300",
       "http://localhost:49321",
       "http://localhost:4400",
@@ -47,7 +45,7 @@ module.exports.security = {
     allowCredentials: true,
     // allowAnyOriginWithCredentialsUnsafe: true,
     allowRequestHeaders:
-      "content-type,id,x-csrf-token,x-access-token,Authorization,X-SSL-client-s-dn,X-SSL-client-i-dn,X-SSL-client-session-id,X-SSL-client-verify,id,mime-type,filename,inviteToken,locale",
+      "content-type,id,x-csrf-token,Authorization,X-SSL-client-s-dn,X-SSL-client-i-dn,X-SSL-client-session-id,X-SSL-client-verify,id,mime-type,filename,inviteToken,locale",
   },
 
   /** **************************************************************************

@@ -65,7 +65,13 @@ module.exports = {
   },
 
   async fn(inputs, exits) {
-    if (process.env.NODE_ENV === 'development') {
+    // In development, skip real SMTP unless explicitly enabled.
+    // MAIL_SEND_IN_DEVELOPMENT=true always opts in; otherwise a non-empty MAIL_SMTP_HOST also opts in
+    // (matches .env.dist). Production (NODE_ENV !== 'development') is unchanged.
+    const isDevelopment = process.env.NODE_ENV === 'development';
+    const forceSendInDev = process.env.MAIL_SEND_IN_DEVELOPMENT === 'true';
+    const hasSmtpHost = !!(process.env.MAIL_SMTP_HOST && String(process.env.MAIL_SMTP_HOST).trim());
+    if (isDevelopment && !(forceSendInDev || hasSmtpHost)) {
       sails.config.customLogger.log('info', 'Email not sent because of development env', inputs);
       sails.config.customLogger.log('info', 'Sending email >', inputs.text);
       return exits.success();

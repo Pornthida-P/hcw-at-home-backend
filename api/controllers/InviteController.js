@@ -177,6 +177,14 @@ module.exports = {
       }
     }
 
+    if (sails.config.globals.REQUIRE_SHARED_QUEUE && !value.queue) {
+      sails.config.customLogger.log('warn', 'Missing required queue', null, 'message', req.user.id);
+      return res.status(400).json({
+        success: false,
+        error: 'queue is required.',
+      });
+    }
+
     const tz = escapeHtml(value.patientTZ) || sails.config.globals.DEFAULT_PATIENT_TIMEZONE
     if (tz) {
       const isTZValid = moment.tz.names().includes(tz);
@@ -636,8 +644,10 @@ module.exports = {
       if (queueObj) {
         inviteData.queue = queueObj.id;
       }
-      if (messageService) {
-        inviteData.messageService = messageService;
+      if (messageService && !(messageService === '4' && !sendLinkManually && (emailAddress || phoneNumber))) {
+        inviteData.messageService = escapeHtml(messageService);
+      } else if (phoneNumber && !sendLinkManually && invite.messageService === '4') {
+        inviteData.messageService = '2';
       }
       if (emailAddress) {
         inviteData.messageService = '3';
@@ -949,9 +959,9 @@ module.exports = {
         return res.notFound();
       }
 
-      await PublicInvite.destroyPatientInvite(invite, req.user?.id);
-      sails.config.customLogger.log('info', `Invite successfully revoked inviteId ${invite.id}`, null, 'server-action', req.user?.id);
-      return res.status(200).send();
+      await PublicInvite.cancelPatientInvite(invite, req.user?.id);
+      sails.config.customLogger.log('info', `Invite successfully canceled inviteId ${invite.id}`, null, 'server-action', req.user?.id);
+      return res.status(200).json({ success: true, status: 'CANCELED' });
     } catch (error) {
       sails.config.customLogger.log('error', 'Error revoking invite', {
         error: error?.message,
@@ -1095,6 +1105,7 @@ module.exports = {
         success: true,
         patientLanguage: publicInvite.patientLanguage,
         requiresAcknowledgment,
+        canceled: publicInvite.status === 'CANCELED',
       });
     } catch (error) {
       sails.config.customLogger.log('error', 'Error checking invite status', {
@@ -1211,7 +1222,9 @@ module.exports = {
         sails.config.customLogger.log('info', `Consultation found for invite consultationId ${consultation.id} inviteId ${inviteId}`, null, 'message', req.user?.id);
       }
 
-      invite.patientURL = `${process.env.PUBLIC_URL}/inv/?invite=${encodeURIComponent(invite.inviteToken)}`;
+      if (invite.status !== 'CANCELED') {
+        invite.patientURL = `${process.env.PUBLIC_URL}/inv/?invite=${encodeURIComponent(invite.inviteToken)}`;
+      }
       sails.config.customLogger.log('info', `Returning invite details for ${inviteId}`, null, 'server-action', req.user?.id);
 
       return res.json(invite);

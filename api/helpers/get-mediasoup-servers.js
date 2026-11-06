@@ -1,13 +1,10 @@
-const axios = require('axios');
+const mediasoupClient = require('../utils/mediasoup-client');
+// health check (/rooms-count) timeout per server
 const FETCH_TIMEOUT = 3000;
-const fallbackMediasoup = {
-  url: process.env.MEDIASOUP_URL,
-  password: process.env.MEDIASOUP_SECRET,
-  username: process.env.MEDIASOUP_USER
-};
+
 module.exports = {
   friendlyName: 'Get mediasoup servers',
-  description: '',
+  description: 'Active, reachable mediasoup servers (falls back to MEDIASOUP_URL)',
   inputs: {},
   exits: {
     success: {
@@ -17,34 +14,44 @@ module.exports = {
 
 
   fn: async function(inputs, exits) {
-    const allServers = await MediasoupServer.find();
-    const servers = allServers.filter(server =>
-      server.active === true || !server.hasOwnProperty('active')
-    );
-
-    sails.config.customLogger.log('verbose',  `servers ${servers}`, null, 'server-action', null);
-
+    const fallbackMediasoup = mediasoupClient.getFallbackServer();
     try {
+      const allServers = await MediasoupServer.find();
+      const servers = allServers.filter(server =>
+        server.active === true || !server.hasOwnProperty('active')
+      );
+
+      sails.config.customLogger.log('verbose', `servers count ${servers.length}`, null, 'server-action', null);
+
       const serversStatues = await Promise.all(servers.map(async server => {
         try {
-          await timeoutPromise(FETCH_TIMEOUT, getRoomsCount(server));
+          server.activeSessions = await timeoutPromise(FETCH_TIMEOUT, mediasoupClient.getRoomsCount(server));
+          server.reachable = true;
           return server;
         } catch (error) {
-          sails.config.customLogger.log('error', `Server ${server.url} is Not reachable`, error, 'server-action', null);
-          return Promise.resolve({ reachable: false });
+          sails.config.customLogger.log('error', `Server ${mediasoupClient.safeOrigin(server.url)} is Not reachable: ${error && error.message}`, null, 'server-action', null);
+          return { reachable: false };
         }
       }));
 
       const availableServers = serversStatues.filter(server => {
-        return (server.activeSessions < server.maxNumberOfSessions) && server.reachable;
+        // a server without maxNumberOfSessions is not limited
+        const hasCapacity = !server.maxNumberOfSessions || server.activeSessions < server.maxNumberOfSessions;
+        return server.reachable && hasCapacity;
       });
 
-      sails.config.customLogger.log('verbose', `AVAILABLE SERVERS:: ${JSON.stringify(availableServers)}`, null,'message', null);
+      sails.config.customLogger.log('verbose', `AVAILABLE SERVERS:: ${availableServers.map(s => mediasoupClient.safeOrigin(s.url)).join(', ')}`, null, 'message', null);
 
       if (!availableServers.length) {
+        if (!fallbackMediasoup.url) {
+          // Say clearly that nothing is configured instead of
+          // returning a server with an undefined URL
+          sails.config.customLogger.log('error', 'NO AVAILABLE MEDIASOUP SERVER AND MEDIASOUP_URL IS NOT SET', null, 'server-action', null);
+          return exits.success([]);
+        }
         sails.config.customLogger.log(
           'info',
-          'NO AVAILABLE SERVER USING FALLBACK ' + fallbackMediasoup.url,
+          'NO AVAILABLE SERVER USING FALLBACK ' + mediasoupClient.safeOrigin(fallbackMediasoup.url),
           null,
           'server-action',
           null
@@ -52,15 +59,18 @@ module.exports = {
         return exits.success([fallbackMediasoup]);
       }
 
-      exits.success(availableServers);
+      return exits.success(availableServers);
     } catch (error) {
+      // Always resolve the helper (it used to never call an exit here,
+      // leaving the HTTP request hanging)
       sails.config.customLogger.log(
         'error',
         'Error with getting Mediasoup server',
-        error,
+        { error: error && error.message },
         'server-action',
         null
       );
+      return exits.success(fallbackMediasoup.url ? [fallbackMediasoup] : []);
     }
   }
 
@@ -83,23 +93,4 @@ function timeoutPromise(ms, promise) {
       }
     );
   });
-}
-
-
-async function getRoomsCount(server) {
-  const response = await axios.get(
-    server.url + '/rooms-count',
-    {
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      auth: {
-        username: server.username,
-        password: server.password
-      }
-    }
-  );
-
-  server.activeSessions = response.data.count;
-  server.reachable = true;
 }

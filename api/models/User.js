@@ -140,6 +140,17 @@ module.exports = {
   async beforeCreate(user, cb) {
     sails.config.customLogger.log('verbose', 'User beforeCreate hook triggered', { userId: user.id || 'new user' }, 'message', null);
     try {
+      // Staff accounts (they log in by e-mail) must be unique per role
+      // even when no password is given (admin-created / OpenID users)
+      if (user.email && ['doctor', 'admin', 'nurse', 'scheduler'].includes(user.role)) {
+        const sameRole = await User.find({ email: user.email, role: user.role }).limit(1);
+        if (sameRole.length) {
+          sails.config.customLogger.log('error', 'User beforeCreate: Email already used for this role', null, 'message', null);
+          return cb({
+            message: 'Email already used'
+          });
+        }
+      }
       if (!user.password) {
         sails.config.customLogger.log('info', 'User beforeCreate: No password provided, skipping password hashing', null, 'message', null);
         return cb();

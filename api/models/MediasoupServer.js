@@ -8,7 +8,16 @@ module.exports = {
       maxLength: 2048,
       description: 'The URL for the mediasoup server',
       example: 'https://example.com',
-      isURL: true
+      // isURL requires a TLD and rejects https://localhost:3443 or an
+      // internal host name; accept any http(s) URL with a host instead
+      custom: function (value) {
+        try {
+          const url = new URL(String(value).trim());
+          return (url.protocol === 'http:' || url.protocol === 'https:') && !!url.hostname;
+        } catch (e) {
+          return false;
+        }
+      }
     },
     password: {
       type: 'string',

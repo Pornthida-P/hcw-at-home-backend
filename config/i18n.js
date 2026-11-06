@@ -17,13 +17,16 @@ const path = require('path');
 
 const localesDir = path.resolve(process.cwd(), 'config', 'locales');
 
+const enabledLocales = ['en', 'th'];
+
 let supportedLocales = [];
 
 try {
   const files = fs.readdirSync(localesDir);
   supportedLocales = files
-    .filter(file => file.endsWith('.json'))
-    .map(file => file.split('.')[0]);
+    .filter(file => file.endsWith('.json') && !file.startsWith('.'))
+    .map(file => file.split('.')[0])
+    .filter(locale => enabledLocales.includes(locale));
 } catch (err) {
   sails.config.customLogger.log('error','Error reading locales directory:', err?.message);
   supportedLocales = ['en'];

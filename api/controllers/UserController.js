@@ -112,12 +112,13 @@ module.exports = {
       });
       // const email = validator.normalizeEmail(req.body.email);
 
-      const firstName = validator.escape(req.body.firstName).trim();
-      const lastName = validator.escape(req.body.lastName).trim();
-      const phoneNumber = validator.escape(req.body.phoneNumber).trim();
-      const organization = validator.escape(req.body.organization).trim();
-      const country = validator.escape(req.body.country).trim();
-      const sex = validator.escape(req.body.sex).trim();
+      const asText = (value) => validator.escape(typeof value === 'string' ? value : '').trim();
+      const firstName = asText(req.body.firstName);
+      const lastName = asText(req.body.lastName);
+      const phoneNumber = asText(req.body.phoneNumber);
+      const organization = asText(req.body.organization);
+      const country = asText(req.body.country);
+      const sex = asText(req.body.sex);
 
       if (!validator.isEmail(email)) {
         return res.badRequest({ error: "Invalid email address." });

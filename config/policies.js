@@ -50,8 +50,8 @@ module.exports.policies = {
     getPaginatedUsers: ["isLoggedIn", "isAdmin"],
     findOne: ["isLoggedIn", "isAdmin"],
     populate: ["isLoggedIn", "isAdmin"],
-    create: ["isLoggedIn", "isAdmin"],
-    update: ["isLoggedIn", "isAdmin"],
+    create: ["isLoggedIn", "isAdmin", "validateUserCreate"],
+    update: ["isLoggedIn", "isAdmin", "validateUserCreate"],
     addDoctorToQueue: ["isLoggedIn", "isAdmin"],
     removeDoctorFromQueue: ["isLoggedIn", "isAdmin"],
     getDoctorQueues: ["isLoggedIn", "isAdmin"],
@@ -94,10 +94,12 @@ module.exports.policies = {
     doctorFeedback: ["isLoggedIn", "isConsultationOwner"],
     updateConsultationNote: ["isLoggedIn", "isConsultationOwner"],
     consultationsCSV: ["isLoggedIn", "isAdmin"],
+    //  aggregated statistics for the admin dashboard
+    consultationsStats: ["isLoggedIn", "isAdmin"],
     testCall: true,
     getCurrentCall: ["isLoggedIn", "isConsultationParticipant"],
     getConsultationFromToken: true,
-    planConsultation:  ["isLoggedIn", "isConsultationParticipant"],
+    planConsultation: ["isLoggedIn", "isConsultationParticipant"],
     // findOne: ['isLoggedIn', 'isConsultationOwnerOrTranslator']
   },
   AuthController: {
@@ -119,6 +121,12 @@ module.exports.policies = {
   },
   ExpertController: {
     sendExpertLink: ["isLoggedIn"],
+    // Current expert link of a consultation (doctor/admin participant only)
+    getExpertLink: [
+      "isLoggedIn",
+      "isDoctorOrAdmin",
+      "isConsultationParticipant",
+    ],
   },
   InviteController: {
     "*": false,

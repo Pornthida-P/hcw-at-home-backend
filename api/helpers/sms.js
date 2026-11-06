@@ -110,7 +110,10 @@ function sendSmsWithSwisscom(phoneNumber, message) {
 }
 
 function sendSmsWithInLog(phoneNumber, message) {
-  sails.config.customLogger.log('info', 'SMS LOG - Message sent via LOG', null, 'message', null);
+  sails.config.customLogger.log('info', 'SMS not sent because of development env (logged only)', {
+    phoneNumber,
+    message,
+  }, 'message', null);
   return new Promise((resolve) => resolve());
 }
 
@@ -417,7 +420,12 @@ module.exports = {
     try {
       const { message, phoneNumber, senderEmail, whatsApp, twilioTemplatedId, params, statusCallback } = inputs || {};
 
-      if (process.env.NODE_ENV === 'development') {
+      // In development, mock SMS to logs unless SMS_SEND_IN_DEVELOPMENT=true.
+      // Note: SMS_DEV_PROVIDER in .env is documented historically but was unused; mock is gated by NODE_ENV.
+      // Production (NODE_ENV !== 'development') still uses real providers unchanged.
+      const isDevelopment = process.env.NODE_ENV === 'development';
+      const forceSendSmsInDev = process.env.SMS_SEND_IN_DEVELOPMENT === 'true';
+      if (isDevelopment && !forceSendSmsInDev) {
         await sendSmsWithInLog(phoneNumber, message);
         return exits.success();
       }

@@ -14,7 +14,11 @@ module.exports = {
         return res.serverError(err);
       }
 
-      const languages = files.map(file => file.split('.').shift());
+      const enabledLocales = sails.config.i18n.locales || ['en'];
+      const languages = files
+        .filter(file => file.endsWith('.json') && !file.startsWith('.'))
+        .map(file => file.split('.').shift())
+        .filter(language => enabledLocales.includes(language));
       sails.config.customLogger.log('info', `Supported languages retrieved ${languages}`, null, 'message', req.user?.id);
       return res.json(languages);
     });
